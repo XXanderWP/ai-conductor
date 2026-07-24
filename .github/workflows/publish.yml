@@ -2,39 +2,119 @@ name: Publish
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Build and pack only (skip npm publish)'
+        description: 'Build and pack only (skip npm publish and GitHub release)'
         type: boolean
         default: false
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 jobs:
   publish:
-    name: Publish to npm
+    name: Publish to npm / GitHub Release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm test
-      - run: npm run build
+
+      - name: Resolve package version
+        id: meta
+        run: |
+          NAME=$(node -e "console.log(JSON.parse(require('fs').readFileSync('package.json','utf8')).name)")
+          VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('package.json','utf8')).version)")
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package: $NAME@$VERSION (tag v$VERSION)"
+
+      - name: Check if version is already on npm
+        id: npm
+        run: |
+          if npm view "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "npm ${{ steps.meta.outputs.version }} already published — skipping npm publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "npm ${{ steps.meta.outputs.version }} not published — will publish"
+          fi
+
+      - name: Check if GitHub Release already exists
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "GitHub Release ${{ steps.meta.outputs.tag }} already exists — skipping"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "GitHub Release ${{ steps.meta.outputs.tag }} missing — will create"
+          fi
+
+      - name: Decide whether build is needed
+        id: gate
+        run: |
+          if [ "${{ steps.npm.outputs.exists }}" != "true" ] || [ "${{ steps.release.outputs.exists }}" != "true" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Build required (npm and/or GitHub Release missing)"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to do — npm package and GitHub Release already exist"
+          fi
+
+      - name: Install dependencies
+        if: steps.gate.outputs.needed == 'true'
+        run: npm ci
+
+      - name: Typecheck
+        if: steps.gate.outputs.needed == 'true'
+        run: npm run typecheck
+
+      - name: Lint
+        if: steps.gate.outputs.needed == 'true'
+        run: npm run lint
+
+      - name: Test
+        if: steps.gate.outputs.needed == 'true'
+        run: npm test
+
+      - name: Build
+        if: steps.gate.outputs.needed == 'true'
+        run: npm run build
+
       - name: Pack
+        if: steps.gate.outputs.needed == 'true'
         run: npm pack
-      - name: Publish
-        if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+
+      - name: Publish to npm
+        if: ${{ steps.npm.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false) }}
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        if: ${{ steps.release.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARGS=()
+          shopt -s nullglob
+          for tgz in *.tgz; do
+            ARGS+=("$tgz")
+          done
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --generate-notes \
+            --target "${{ github.sha }}" \
+            "${ARGS[@]}"
