@@ -8,6 +8,7 @@ Guide agents implementing or extending the AI Conductor public API and provider 
 
 - `Conductor` — main orchestrator (`new Conductor({ configPath })` or inline options)
 - `conductor.chat(messages | string, options?)` — routed chat completion
+- `conductor.compressContext(messages, { keepLast?, ... })` — fold earlier turns into a system summary, keep the recent tail
 - `conductor.getAvailableProviders()` — built-in registry metadata
 - `conductor.getConfiguredProviders()` — providers from the loaded config
 - `conductor.listModels(providerId | options?)` — parse OpenAI-compatible `GET /models` (Puter / Ollama fallbacks)

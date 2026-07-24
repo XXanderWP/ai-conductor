@@ -35,6 +35,8 @@ export type {
   ListModelsResult,
   ProviderTestOptions,
   ProviderTestResult,
+  CompressContextOptions,
+  CompressContextResult,
 } from './types.js';
 export type { OpenAIModelInfo, OpenAIListModelsResult } from './providers/openai-client.js';
 export { openaiListModels, normalizeProviderModelId } from './providers/openai-client.js';

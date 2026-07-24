@@ -70,6 +70,7 @@ All code, documentation, comments, commit messages in this repository, and skill
 - Provider registry lives in `src/providers/registry.ts`.
 - Strategies: `cheapest`, `priority`, `failover`, `round-robin`, `first-available`.
 - Discovery / probes: `getAvailableProviders`, `getConfiguredProviders`, `listModels`, `testProvider` / `testProviders` (`real?: boolean`).
+- Context: `compressContext(messages, { keepLast? })` folds earlier turns into a system summary.
 
 <!-- GENERATED:START -->
 <!-- GENERATED:END -->

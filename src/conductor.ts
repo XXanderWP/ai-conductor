@@ -16,6 +16,8 @@ import { DailyUsageTracker } from './routing/usage.js';
 import type {
   ChatOptions,
   ChatResponse,
+  CompressContextOptions,
+  CompressContextResult,
   ListModelsResult,
   Message,
   ProviderTestOptions,
@@ -27,6 +29,14 @@ import { formatSuggestions } from './utils/suggest.js';
 
 const DEFAULT_TEST_PROMPT = 'Reply with exactly: ok';
 const DEFAULT_CONNECTIVITY_TIMEOUT_MS = 15_000;
+const DEFAULT_KEEP_LAST = 4;
+
+const DEFAULT_SUMMARY_PROMPT = [
+  'Summarize the following conversation so it can replace the earlier turns.',
+  'Capture the topic, key facts, decisions, open questions, and user preferences.',
+  'Write in the same language as the conversation. Be concise but complete.',
+  'Do not continue the dialogue. Reply with the summary only.',
+].join(' ');
 
 /**
  * Orchestrate any AI provider through one API.
@@ -164,6 +174,105 @@ export class Conductor {
       results.push(await this.testProvider(entry.id, options));
     }
     return results;
+  }
+
+  /**
+   * Compress a dialog by summarizing earlier turns into a system message.
+   *
+   * Keeps the last `keepLast` user/assistant messages verbatim and folds the
+   * rest into a system note describing what the conversation was about.
+   * Existing system messages are preserved and merged with the summary.
+   *
+   * @example
+   * ```ts
+   * const { messages } = await conductor.compressContext(history, { keepLast: 4 });
+   * history.splice(0, history.length, ...messages);
+   * ```
+   */
+  async compressContext(
+    messages: Message[],
+    options?: CompressContextOptions,
+  ): Promise<CompressContextResult> {
+    await this.ready;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      throw new Error('compressContext() requires a non-empty message array.');
+    }
+
+    const cloned = messages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    }));
+
+    const systemMessages = cloned.filter((message) => message.role === 'system');
+    const conversation = cloned.filter((message) => message.role !== 'system');
+    const keepLast = Math.max(0, options?.keepLast ?? DEFAULT_KEEP_LAST);
+
+    if (conversation.length <= keepLast) {
+      return {
+        messages: cloned,
+        summary: '',
+        foldedCount: 0,
+      };
+    }
+
+    const foldStart = 0;
+    const foldEnd = conversation.length - keepLast;
+    const toFold = conversation.slice(foldStart, foldEnd);
+    const kept = conversation.slice(foldEnd);
+    const transcript = toFold.map((message) => `${message.role}: ${message.content}`).join('\n');
+
+    const summaryPrompt = options?.summaryPrompt?.trim() || DEFAULT_SUMMARY_PROMPT;
+    const {
+      provider: chatProvider,
+      model,
+      temperature,
+      topP,
+      maxTokens,
+      frequencyPenalty,
+      presencePenalty,
+      stop,
+      timeoutMs,
+      metadata,
+    } = options ?? {};
+
+    const summaryResponse = await this.chat(
+      [
+        { role: 'system', content: summaryPrompt },
+        {
+          role: 'user',
+          content: `Conversation to summarize:\n\n${transcript}`,
+        },
+      ],
+      {
+        provider: chatProvider,
+        model,
+        temperature: temperature ?? 0.2,
+        topP,
+        maxTokens: maxTokens ?? 512,
+        frequencyPenalty,
+        presencePenalty,
+        stop,
+        timeoutMs,
+        metadata,
+      },
+    );
+
+    const summary = summaryResponse.content.trim();
+    if (!summary) {
+      throw new Error('compressContext() received an empty summary from the provider.');
+    }
+
+    const systemParts = systemMessages.map((message) => message.content.trim()).filter(Boolean);
+    systemParts.push(`Prior conversation context:\n${summary}`);
+
+    return {
+      messages: [{ role: 'system', content: systemParts.join('\n\n') }, ...kept],
+      summary,
+      foldedCount: toFold.length,
+      provider: summaryResponse.provider,
+      model: summaryResponse.model,
+    };
   }
 
   /**

@@ -111,3 +111,27 @@ export interface ProviderTestResult {
     chatResponse?: boolean;
   };
 }
+
+/** Options for {@link Conductor.compressContext}. */
+export interface CompressContextOptions extends ChatOptions {
+  /**
+   * How many recent user/assistant messages to keep verbatim.
+   * Older turns are summarized into a system note. Default: `4`.
+   */
+  keepLast?: number;
+  /** Override the instruction sent to the model that writes the summary. */
+  summaryPrompt?: string;
+}
+
+/** Result of {@link Conductor.compressContext}. */
+export interface CompressContextResult {
+  /** Compressed dialog ready for the next {@link Conductor.chat} call. */
+  messages: Message[];
+  /** Summary text placed in the system message (empty when nothing was folded). */
+  summary: string;
+  /** Number of earlier non-system messages folded into the summary. */
+  foldedCount: number;
+  /** Provider that produced the summary, when a model call was made. */
+  provider?: ProviderId | string;
+  model?: string;
+}

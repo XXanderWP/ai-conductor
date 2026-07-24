@@ -115,6 +115,15 @@ await conductor.testProvider('gemini', { real: true });
 await conductor.testProviders({ real: true });
 ```
 
+## Compress dialog context
+
+```ts
+const { messages } = await conductor.compressContext(history, {
+  keepLast: 4, // keep the last 4 user/assistant messages
+});
+// messages[0] is a system note about earlier turns; the rest is the recent tail
+```
+
 ## Development
 
 ```bash

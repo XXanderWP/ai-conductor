@@ -321,4 +321,77 @@ fallback:
     expect(result.mode).toBe('connectivity');
     expect(result.error).toMatch(/Incorrect API key/i);
   });
+
+  it('compresses earlier turns into a system summary and keeps the recent tail', async () => {
+    let capturedBody: unknown;
+    const conductor = new Conductor({
+      providers: [{ id: 'gemini', apiKey: 'g', model: 'gemini-flash-latest' }],
+      fetch: async (_input, init) => {
+        capturedBody = JSON.parse(String(init?.body));
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: 'User asked about shipping and chose express delivery.',
+              },
+            },
+          ],
+          model: 'gemini-flash-latest',
+        });
+      },
+    });
+
+    const history = [
+      { role: 'system' as const, content: 'You are a helpful shop assistant.' },
+      { role: 'user' as const, content: 'I need to ship a package' },
+      { role: 'assistant' as const, content: 'Where to?' },
+      { role: 'user' as const, content: 'Berlin' },
+      { role: 'assistant' as const, content: 'Express or standard?' },
+      { role: 'user' as const, content: 'Express please' },
+      { role: 'assistant' as const, content: 'Booked express to Berlin.' },
+    ];
+
+    const result = await conductor.compressContext(history, { keepLast: 2 });
+
+    expect(result.foldedCount).toBe(4);
+    expect(result.summary).toBe('User asked about shipping and chose express delivery.');
+    expect(result.provider).toBe('gemini');
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[0]).toEqual({
+      role: 'system',
+      content:
+        'You are a helpful shop assistant.\n\nPrior conversation context:\nUser asked about shipping and chose express delivery.',
+    });
+    expect(result.messages.slice(1)).toEqual([
+      { role: 'user', content: 'Express please' },
+      { role: 'assistant', content: 'Booked express to Berlin.' },
+    ]);
+
+    const body = capturedBody as { messages: Array<{ role: string; content: string }> };
+    expect(body.messages[0]?.role).toBe('system');
+    expect(body.messages[1]?.content).toContain('user: I need to ship a package');
+    expect(body.messages[1]?.content).not.toContain('Express please');
+  });
+
+  it('returns the original dialog when there is nothing to fold', async () => {
+    let calls = 0;
+    const conductor = new Conductor({
+      providers: [{ id: 'ollama', model: 'llama3.2' }],
+      fetch: async () => {
+        calls += 1;
+        return jsonResponse({ choices: [{ message: { content: 'noop' } }] });
+      },
+    });
+
+    const history = [
+      { role: 'user' as const, content: 'hi' },
+      { role: 'assistant' as const, content: 'hello' },
+    ];
+    const result = await conductor.compressContext(history, { keepLast: 4 });
+
+    expect(calls).toBe(0);
+    expect(result.foldedCount).toBe(0);
+    expect(result.summary).toBe('');
+    expect(result.messages).toEqual(history);
+  });
 });
