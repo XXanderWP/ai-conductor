@@ -1,11 +1,19 @@
 # AI Conductor
 
+[![CI](https://github.com/XXanderWP/ai-conductor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/XXanderWP/ai-conductor/actions/workflows/ci.yml)
+[![Publish](https://github.com/XXanderWP/ai-conductor/actions/workflows/publish.yml/badge.svg)](https://github.com/XXanderWP/ai-conductor/actions/workflows/publish.yml)
+[![npm version](https://img.shields.io/npm/v/@xxanderwp/ai-conductor.svg?logo=npm&label=npm)](https://www.npmjs.com/package/@xxanderwp/ai-conductor)
+[![npm downloads](https://img.shields.io/npm/dm/@xxanderwp/ai-conductor.svg?logo=npm)](https://www.npmjs.com/package/@xxanderwp/ai-conductor)
+[![Node.js](https://img.shields.io/node/v/@xxanderwp/ai-conductor.svg?logo=node.js&label=node)](https://www.npmjs.com/package/@xxanderwp/ai-conductor)
+[![GitHub release](https://img.shields.io/github/v/release/XXanderWP/ai-conductor?logo=github&label=release)](https://github.com/XXanderWP/ai-conductor/releases)
+[![License: MIT](https://img.shields.io/github/license/XXanderWP/ai-conductor)](./LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+
 **Orchestrate any AI provider through one API.**
 
 AI Conductor connects multiple OpenAI-compatible AI providers and routes chat requests through a single entry point. Prefer cheaper/free tiers with the `cheapest` strategy, spread load with round-robin, or fail over when a provider is rate-limited.
 
 - **Author:** XXanderWP
-- **License:** MIT
 
 ## Install
 
