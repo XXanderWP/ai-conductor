@@ -42,7 +42,7 @@ describe('normalizeConfig', () => {
 });
 
 describe('provider registry', () => {
-  it('includes the StreamKitPlus provider set', () => {
+  it('includes the built-in provider set', () => {
     expect(Object.keys(PROVIDERS).sort()).toEqual(
       [
         'cerebras',

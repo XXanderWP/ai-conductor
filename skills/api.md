@@ -9,7 +9,7 @@ Guide agents implementing or extending the AI Conductor public API and provider 
 - `Conductor` — main orchestrator (`new Conductor({ configPath })` or inline options)
 - `conductor.chat(messages | string, options?)` — routed chat completion
 - YAML / object config: `providers`, `routing.strategy`, `fallback`, `defaults`
-- `PROVIDERS` — built-in OpenAI-compatible registry (StreamKitPlus-compatible ids)
+- `PROVIDERS` — built-in OpenAI-compatible provider registry
 
 ## Provider ids
 

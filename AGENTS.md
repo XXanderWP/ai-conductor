@@ -67,7 +67,7 @@ All code, documentation, comments, commit messages in this repository, and skill
 ## Public API notes
 
 - Construct with `configPath` and/or inline `providers` / `routing` / `fallback` / `apiKeys`.
-- Provider registry lives in `src/providers/registry.ts` (aligned with StreamKitPlus).
+- Provider registry lives in `src/providers/registry.ts`.
 - Strategies: `cheapest`, `priority`, `failover`, `round-robin`, `first-available`.
 
 <!-- GENERATED:START -->

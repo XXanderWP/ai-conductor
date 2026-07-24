@@ -74,7 +74,7 @@ fallback:
 
 ## Built-in providers
 
-Same OpenAI-compatible set as StreamKitPlus LLM Access:
+Built-in OpenAI-compatible providers:
 
 `ollama`, `gemini`, `groq`, `cerebras`, `mistral`, `nvidia`, `github`, `zai`, `puter`, `opencode`, `huggingface`, `openrouter`, `cohere`, `openai`, `openai_compatible`
 

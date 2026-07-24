@@ -1,6 +1,5 @@
 /**
  * Built-in OpenAI-compatible provider registry.
- * Ported from StreamKitPlus LLM Access (`shared/llm.ts`).
  */
 
 /** Built-in LLM inference provider ids. */
