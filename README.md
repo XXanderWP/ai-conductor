@@ -98,6 +98,23 @@ Built-in OpenAI-compatible providers:
 
 `fallback` appends extra providers after the primary ordered list. `dailyLimit` soft-skips a provider for the rest of the UTC day once the cap is reached.
 
+## Providers, models, and probes
+
+```ts
+// Built-in registry vs current config
+conductor.getAvailableProviders();
+conductor.getConfiguredProviders();
+
+// Parse OpenAI-compatible model catalogs
+const geminiModels = await conductor.listModels('gemini');
+const allModels = await conductor.listModels();
+
+// Connectivity (API key + /models) vs real chat
+await conductor.testProvider('gemini'); // real omitted → connectivity
+await conductor.testProvider('gemini', { real: true });
+await conductor.testProviders({ real: true });
+```
+
 ## Development
 
 ```bash

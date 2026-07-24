@@ -225,40 +225,30 @@ type ProviderProbeResult = {
   error?: string;
 };
 
-async function testAllProviders(
-  conductor: Conductor,
-  providerIds: string[],
-): Promise<ProviderProbeResult[]> {
-  const results: ProviderProbeResult[] = [];
+async function testAllProviders(conductor: Conductor): Promise<ProviderProbeResult[]> {
+  const results = await conductor.testProviders({ real: true, prompt: TEST_PROMPT });
 
-  for (const id of providerIds) {
-    process.stdout.write(paint('dim', `▸ probing ${id}… `));
-    const started = Date.now();
-    try {
-      const response = await conductor.chat(TEST_PROMPT, { provider: id });
-      const ms = Date.now() - started;
-      const preview = response.content.replace(/\s+/g, ' ').trim().slice(0, 80);
-      console.log(paint('green', `ok (${ms}ms)`));
-      if (preview) {
-        console.log(paint('dim', `  ${preview}`));
+  for (const result of results) {
+    process.stdout.write(paint('dim', `▸ probing ${result.provider}… `));
+    if (result.ok) {
+      console.log(paint('green', `ok (${result.ms}ms)`));
+      if (result.preview) {
+        console.log(paint('dim', `  ${result.preview}`));
       }
-      results.push({
-        id,
-        ok: true,
-        ms,
-        model: response.model,
-        preview,
-      });
-    } catch (error) {
-      const ms = Date.now() - started;
-      const message = error instanceof Error ? error.message : String(error);
-      console.log(paint('red', `fail (${ms}ms)`));
-      console.log(paint('red', `  ${message}`));
-      results.push({ id, ok: false, ms, error: message });
+    } else {
+      console.log(paint('red', `fail (${result.ms}ms)`));
+      console.log(paint('red', `  ${result.error ?? 'unknown error'}`));
     }
   }
 
-  return results;
+  return results.map((result) => ({
+    id: String(result.provider),
+    ok: result.ok,
+    ms: result.ms,
+    model: result.model,
+    preview: result.preview,
+    error: result.error,
+  }));
 }
 
 function printProbeSummary(results: ProviderProbeResult[]): void {
@@ -371,7 +361,7 @@ async function main(): Promise<void> {
         continue;
       }
       console.log();
-      const results = await testAllProviders(conductor, providerIds);
+      const results = await testAllProviders(conductor);
       printProbeSummary(results);
       continue;
     }

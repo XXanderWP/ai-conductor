@@ -64,3 +64,50 @@ export interface GenerationParams {
   presencePenalty?: number;
   stop?: string[];
 }
+
+/** Model entry returned by {@link Conductor.listModels}. */
+export interface ModelInfo {
+  id: string;
+  ownedBy?: string;
+}
+
+/** Result of listing models for one provider. */
+export interface ListModelsResult {
+  ok: boolean;
+  provider: ProviderId | string;
+  models: ModelInfo[];
+  error?: string;
+}
+
+/** Options for {@link Conductor.testProvider} / {@link Conductor.testProviders}. */
+export interface ProviderTestOptions {
+  /**
+   * When `true`, send a real chat completion and require non-empty content.
+   * When `false` / omitted, only check API key presence and the models endpoint.
+   */
+  real?: boolean;
+  /** Prompt used when `real` is true (default: `Reply with exactly: ok`). */
+  prompt?: string;
+  /** Per-request timeout in milliseconds. */
+  timeoutMs?: number;
+}
+
+/** Result of a provider connectivity or real chat probe. */
+export interface ProviderTestResult {
+  provider: ProviderId | string;
+  ok: boolean;
+  /** `connectivity` = key + models list; `real` = chat completion. */
+  mode: 'connectivity' | 'real';
+  ms: number;
+  model?: string;
+  /** Number of models returned by the catalog probe (connectivity mode). */
+  modelsCount?: number;
+  /** Short preview of the chat reply (real mode). */
+  preview?: string;
+  error?: string;
+  checks?: {
+    apiKeyPresent?: boolean;
+    modelsEndpoint?: boolean;
+    chatResponse?: boolean;
+  };
+}

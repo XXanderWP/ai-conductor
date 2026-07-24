@@ -31,4 +31,10 @@ export type {
   RoutingStrategy,
   GenerationParams,
   TokenUsage,
+  ModelInfo,
+  ListModelsResult,
+  ProviderTestOptions,
+  ProviderTestResult,
 } from './types.js';
+export type { OpenAIModelInfo, OpenAIListModelsResult } from './providers/openai-client.js';
+export { openaiListModels, normalizeProviderModelId } from './providers/openai-client.js';

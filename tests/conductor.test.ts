@@ -228,4 +228,97 @@ fallback:
       /not in the current config/i,
     );
   });
+
+  it('lists available and configured providers', async () => {
+    const conductor = new Conductor({
+      providers: [
+        { id: 'gemini', apiKey: 'g', model: 'gemini-flash-latest' },
+        { id: 'groq', apiKey: 'q', model: 'llama-3.1-8b-instant', enabled: false },
+      ],
+      fetch: async () => jsonResponse({ choices: [{ message: { content: 'x' } }] }),
+    });
+    await conductor.whenReady();
+
+    const available = conductor.getAvailableProviders();
+    expect(available.map((p) => p.id)).toEqual(
+      expect.arrayContaining(['gemini', 'groq', 'ollama']),
+    );
+    expect(available).toHaveLength(Object.keys(PROVIDERS).length);
+
+    const configured = conductor.getConfiguredProviders();
+    expect(configured.map((p) => p.id)).toEqual(['gemini', 'groq']);
+  });
+
+  it('parses models from the OpenAI-compatible catalog', async () => {
+    const conductor = new Conductor({
+      providers: [{ id: 'gemini', apiKey: 'g', model: 'gemini-flash-latest' }],
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith('/models')) {
+          return jsonResponse({
+            data: [
+              { id: 'models/gemini-2.0.flash', owned_by: 'google' },
+              { id: 'gemini-flash-latest', owned_by: 'google' },
+            ],
+          });
+        }
+        return jsonResponse({ error: { message: 'unexpected' } }, 500);
+      },
+    });
+
+    const result = await conductor.listModels('gemini');
+    expect(result.ok).toBe(true);
+    expect(result.models).toEqual([
+      { id: 'gemini-2.0-flash', ownedBy: 'google' },
+      { id: 'gemini-flash-latest', ownedBy: 'google' },
+    ]);
+  });
+
+  it('runs connectivity and real provider tests', async () => {
+    const calls: string[] = [];
+    const conductor = new Conductor({
+      providers: [{ id: 'groq', apiKey: 'q', model: 'llama-3.1-8b-instant' }],
+      fetch: async (input, init) => {
+        const url = String(input);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        calls.push(`${method} ${url.includes('/chat/completions') ? 'chat' : 'models'}`);
+
+        if (url.includes('/models')) {
+          return jsonResponse({
+            data: [{ id: 'llama-3.1-8b-instant', owned_by: 'groq' }],
+          });
+        }
+
+        return jsonResponse({
+          choices: [{ message: { content: 'ok' } }],
+          model: 'llama-3.1-8b-instant',
+        });
+      },
+    });
+
+    const connectivity = await conductor.testProvider('groq');
+    expect(connectivity.ok).toBe(true);
+    expect(connectivity.mode).toBe('connectivity');
+    expect(connectivity.modelsCount).toBe(1);
+    expect(connectivity.checks).toEqual({ apiKeyPresent: true, modelsEndpoint: true });
+
+    const real = await conductor.testProvider('groq', { real: true });
+    expect(real.ok).toBe(true);
+    expect(real.mode).toBe('real');
+    expect(real.preview).toBe('ok');
+    expect(real.checks?.chatResponse).toBe(true);
+    expect(calls).toEqual(['GET models', 'POST chat']);
+  });
+
+  it('fails connectivity tests when the models endpoint rejects the key', async () => {
+    const conductor = new Conductor({
+      providers: [{ id: 'openai', apiKey: 'bad', model: 'gpt-4o-mini' }],
+      fetch: async () => jsonResponse({ error: { message: 'Incorrect API key' } }, 401),
+    });
+
+    const result = await conductor.testProvider('openai');
+    expect(result.ok).toBe(false);
+    expect(result.mode).toBe('connectivity');
+    expect(result.error).toMatch(/Incorrect API key/i);
+  });
 });

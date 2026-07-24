@@ -8,6 +8,10 @@ Guide agents implementing or extending the AI Conductor public API and provider 
 
 - `Conductor` — main orchestrator (`new Conductor({ configPath })` or inline options)
 - `conductor.chat(messages | string, options?)` — routed chat completion
+- `conductor.getAvailableProviders()` — built-in registry metadata
+- `conductor.getConfiguredProviders()` — providers from the loaded config
+- `conductor.listModels(providerId | options?)` — parse OpenAI-compatible `GET /models` (Puter / Ollama fallbacks)
+- `conductor.testProvider(id, { real? })` / `conductor.testProviders({ real? })` — connectivity (`real` omitted/false: API key + models) or real chat probe (`real: true`)
 - YAML / object config: `providers`, `routing.strategy`, `fallback`, `defaults`
 - `PROVIDERS` — built-in OpenAI-compatible provider registry
 
@@ -23,7 +27,7 @@ Guide agents implementing or extending the AI Conductor public API and provider 
 
 1. Prefer configuring an existing registry id with `baseUrl` / `model` / `apiKey`.
 2. Use `openai_compatible` for custom OpenAI-compatible gateways.
-3. HTTP goes through `src/providers/openai-client.ts` (`fetch`).
+3. HTTP goes through `src/providers/openai-client.ts` (`fetch`) — chat + `openaiListModels`.
 4. Keep unit tests offline via injected `fetch` — never hit live APIs in CI.
 
 ## Do / Don't

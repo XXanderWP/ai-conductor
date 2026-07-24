@@ -69,6 +69,7 @@ All code, documentation, comments, commit messages in this repository, and skill
 - Construct with `configPath` and/or inline `providers` / `routing` / `fallback` / `apiKeys`.
 - Provider registry lives in `src/providers/registry.ts`.
 - Strategies: `cheapest`, `priority`, `failover`, `round-robin`, `first-available`.
+- Discovery / probes: `getAvailableProviders`, `getConfiguredProviders`, `listModels`, `testProvider` / `testProviders` (`real?: boolean`).
 
 <!-- GENERATED:START -->
 <!-- GENERATED:END -->
