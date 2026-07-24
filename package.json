@@ -1,6 +1,6 @@
 {
   "name": "@xxanderwp/ai-conductor",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Orchestrate any AI provider through one API.",
   "author": "XXanderWP",
   "license": "MIT",
