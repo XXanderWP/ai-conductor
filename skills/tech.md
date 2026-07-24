@@ -37,10 +37,21 @@ npm run lint
 npm run format
 npm test
 npm run build
+npm run playground
 npm run docs:sync
 npm run docs:check
 npm run release
 ```
+
+## Playground
+
+Interactive CLI chat against a live config:
+
+1. `cp config.yml.example config.yml` (file is gitignored)
+2. Fill API keys / env placeholders
+3. `npm run playground`
+
+Optional: `npm run playground -- --config ./path/to.yml`
 
 ## Conventions
 

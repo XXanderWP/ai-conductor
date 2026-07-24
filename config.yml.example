@@ -1,0 +1,31 @@
+# Local playground config (API keys). Not committed.
+# Copy from examples/config.yml:
+#   cp examples/config.yml config.yml
+providers:
+  - id: gemini
+    priority: 100
+    dailyLimit: 1000
+    apiKey: ${GEMINI_API_KEY}
+    model: gemini-flash-latest
+
+  - id: groq
+    priority: 90
+    apiKey: ${GROQ_API_KEY}
+    model: llama-3.1-8b-instant
+
+  - id: openrouter
+    priority: 50
+    apiKey: ${OPENROUTER_API_KEY}
+    model: openrouter/free
+
+routing:
+  strategy: cheapest
+
+fallback:
+  - gemini
+  - groq
+  - openrouter
+
+defaults:
+  temperature: 0.7
+  timeoutMs: 120000

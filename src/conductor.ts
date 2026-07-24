@@ -1,11 +1,12 @@
 import { loadConfigFile, mergeConfig, resolveApiKey } from './config/load.js';
 import type { ConductorConfig, ConductorInitOptions, ProviderConfig } from './config/types.js';
 import { openaiChatCompletion, type ResolvedProviderEndpoint } from './providers/openai-client.js';
-import { PROVIDERS, type ProviderId } from './providers/registry.js';
+import { isProviderId, PROVIDERS, type ProviderId } from './providers/registry.js';
 import { orderProviders } from './routing/order.js';
 import { DailyUsageTracker } from './routing/usage.js';
 import type { ChatOptions, ChatResponse, Message, RoutingStrategy } from './types.js';
 import { normalizeMessages } from './utils.js';
+import { formatSuggestions } from './utils/suggest.js';
 
 /**
  * Orchestrate any AI provider through one API.
@@ -65,6 +66,10 @@ export class Conductor {
     await this.ready;
     const messages = normalizeMessages(input);
     const strategy = this.getStrategy();
+
+    if (options?.provider) {
+      this.assertProviderOption(options.provider);
+    }
 
     const { ordered, nextRoundRobinIndex } = orderProviders({
       providers: this.config.providers,
@@ -132,6 +137,32 @@ export class Conductor {
       fileConfig = await loadConfigFile(this.init.configPath);
     }
     this.config = mergeConfig(fileConfig, this.init);
+  }
+
+  private assertProviderOption(providerId: string): void {
+    const configuredIds = this.config.providers.map((p) => p.id);
+    const knownIds = Object.keys(PROVIDERS);
+
+    if (!isProviderId(providerId)) {
+      throw new Error(
+        `Unknown provider id "${providerId}". ${formatSuggestions(providerId, knownIds)}`,
+      );
+    }
+
+    if (!configuredIds.includes(providerId)) {
+      throw new Error(
+        `Provider "${providerId}" is not in the current config. ${formatSuggestions(providerId, configuredIds)}`,
+      );
+    }
+
+    const entry = this.config.providers.find((p) => p.id === providerId);
+    if (entry?.enabled === false) {
+      throw new Error(`Provider "${providerId}" is disabled in the config.`);
+    }
+
+    if (this.usage.isExhausted(providerId, entry?.dailyLimit)) {
+      throw new Error(`Provider "${providerId}" reached its dailyLimit (${entry?.dailyLimit}).`);
+    }
   }
 
   private toEndpoint(providerConfig: ProviderConfig): ResolvedProviderEndpoint {

@@ -101,6 +101,15 @@ npm run build
 npm run docs:sync
 ```
 
+### Playground (CLI TUI)
+
+```bash
+cp config.yml.example config.yml   # gitignored — add your keys
+npm run playground
+```
+
+Commands inside the chat: `/status`, `/clear`, `/provider <id|auto>`, `/test-all` (confirm), `/quit` (Tab completes commands and provider ids).
+
 ## LLM agents
 
 - [`AGENTS.md`](./AGENTS.md) — how agents should navigate this project
@@ -127,6 +136,7 @@ npm run docs:sync
 .github/workflows/docs-sync.yml
 .github/workflows/publish.yml
 scripts/
+scripts/playground.mts
 scripts/sync-docs.mjs
 skills/
 skills/api.md
@@ -146,9 +156,12 @@ src/routing/
 src/routing/order.ts
 src/routing/usage.ts
 src/types.ts
+src/utils/
+src/utils/suggest.ts
 src/utils.ts
 tests/
 tests/conductor.test.ts
+tests/suggest.test.ts
 ```
 
 ### Skills for LLM agents
@@ -167,6 +180,7 @@ tests/conductor.test.ts
 | `npm run lint`          | ESLint check                                          |
 | `npm run format`        | Format with Prettier                                  |
 | `npm run typecheck`     | TypeScript `--noEmit` check                           |
+| `npm run playground`    | Interactive CLI chat against root `config.yml`        |
 | `npm run docs:sync`     | Refresh generated README / AGENTS sections            |
 | `npm run docs:check`    | Fail if generated docs are stale                      |
 | `npm run release`       | Publish to npm (`prepublishOnly` runs checks + build) |

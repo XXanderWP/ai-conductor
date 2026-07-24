@@ -22,6 +22,7 @@ export type {
   RoutingConfig,
 } from './config/types.js';
 export { normalizeMessages, toPrompt } from './utils.js';
+export { suggestClosest, formatSuggestions } from './utils/suggest.js';
 export type {
   Message,
   MessageRole,

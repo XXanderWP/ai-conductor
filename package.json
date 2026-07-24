@@ -33,6 +33,7 @@
     "typecheck": "tsc --noEmit",
     "docs:sync": "node scripts/sync-docs.mjs",
     "docs:check": "node scripts/sync-docs.mjs --check",
+    "playground": "tsx scripts/playground.mts",
     "prepublishOnly": "npm run typecheck && npm run lint && npm run test && npm run build",
     "release": "npm publish --access public"
   },
@@ -75,6 +76,7 @@
     "prettier": "^3.6.2",
     "ts-jest": "^29.4.0",
     "tsup": "^8.5.0",
+    "tsx": "^4.23.1",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.37.0"
   }

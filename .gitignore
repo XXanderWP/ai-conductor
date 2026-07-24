@@ -12,3 +12,6 @@ coverage/
 !.vscode/extensions.json
 *.tgz
 .turbo/
+
+# Local playground config with secrets — use config.yml.example
+/config.yml

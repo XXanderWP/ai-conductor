@@ -111,6 +111,7 @@ ${
 | \`npm run lint\` | ESLint check |
 | \`npm run format\` | Format with Prettier |
 | \`npm run typecheck\` | TypeScript \`--noEmit\` check |
+| \`npm run playground\` | Interactive CLI chat against root \`config.yml\` |
 | \`npm run docs:sync\` | Refresh generated README / AGENTS sections |
 | \`npm run docs:check\` | Fail if generated docs are stale |
 | \`npm run release\` | Publish to npm (\`prepublishOnly\` runs checks + build) |

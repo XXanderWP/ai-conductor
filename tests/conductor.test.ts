@@ -193,4 +193,39 @@ fallback:
     expect(response.provider).toBe('ollama');
     expect(response.content).toBe('local');
   });
+
+  it('suggests corrections for mistyped provider ids', async () => {
+    const conductor = new Conductor({
+      providers: [
+        { id: 'mistral', apiKey: 'x', model: 'mistral-small-latest' },
+        { id: 'gemini', apiKey: 'y', model: 'gemini-flash-latest' },
+      ],
+      routing: { strategy: 'priority' },
+      fetch: async () =>
+        jsonResponse({
+          choices: [{ message: { content: 'ok' } }],
+          model: 'm',
+        }),
+    });
+
+    await expect(conductor.chat('hi', { provider: 'mistal' })).rejects.toThrow(
+      /Unknown provider id "mistal".*Did you mean:.*mistral/i,
+    );
+  });
+
+  it('rejects known providers that are not in the config', async () => {
+    const conductor = new Conductor({
+      providers: [{ id: 'gemini', apiKey: 'y', model: 'gemini-flash-latest' }],
+      routing: { strategy: 'priority' },
+      fetch: async () =>
+        jsonResponse({
+          choices: [{ message: { content: 'ok' } }],
+          model: 'm',
+        }),
+    });
+
+    await expect(conductor.chat('hi', { provider: 'mistral' })).rejects.toThrow(
+      /not in the current config/i,
+    );
+  });
 });
