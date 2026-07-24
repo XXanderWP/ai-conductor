@@ -12,7 +12,7 @@ Describe the technical stack, directories, scripts, and conventions for **AI Con
 - **Tests:** Jest + `ts-jest` (ESM), files in `tests/**/*.test.ts`
 - **Lint / format:** ESLint 9 flat config + Prettier
 - **Config:** YAML via `yaml` package (`configPath` or inline object)
-- **CI:** GitHub Actions (test, docs check, publish)
+- **CI:** GitHub Actions (test, docs check, publish); local `pre-push` runs `format:check` + `docs:check`
 
 ## Directories
 
@@ -26,7 +26,7 @@ Describe the technical stack, directories, scripts, and conventions for **AI Con
 | `examples/`          | Sample configs                                     |
 | `skills/`            | Agent skill markdown files                         |
 | `scripts/`           | Node maintenance scripts                           |
-| `.github/workflows/` | CI / publish / docs                                |
+| `.github/workflows/` | CI / publish                               |
 
 ## Essential commands
 
@@ -42,6 +42,8 @@ npm run docs:sync
 npm run docs:check
 npm run release
 ```
+
+`npm install` installs a `pre-push` git hook (`simple-git-hooks`) that runs `format:check` and `docs:check` and blocks the push if either fails.
 
 ## Playground
 
