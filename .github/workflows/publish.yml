@@ -1,9 +1,10 @@
 name: Publish
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -18,9 +19,12 @@ permissions:
 jobs:
   publish:
     name: Publish to npm / GitHub Release
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       # Node 24 ships npm >= 11.5.1 required for Trusted Publishing (OIDC).
       # Do not set registry-url: it writes an empty _authToken and blocks OIDC.
@@ -99,14 +103,15 @@ jobs:
         run: npm pack
 
       - name: Publish to npm
-        if: ${{ steps.npm.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false) }}
+        if: ${{ steps.npm.outputs.exists != 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false) }}
         run: npm publish --access public --provenance
 
       - name: Create GitHub Release
-        if: ${{ steps.release.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false) }}
+        if: ${{ steps.release.outputs.exists != 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          TARGET="${{ github.event.workflow_run.head_sha || github.sha }}"
           ARGS=()
           shopt -s nullglob
           for tgz in *.tgz; do
@@ -115,5 +120,5 @@ jobs:
           gh release create "${{ steps.meta.outputs.tag }}" \
             --title "${{ steps.meta.outputs.tag }}" \
             --generate-notes \
-            --target "${{ github.sha }}" \
+            --target "$TARGET" \
             "${ARGS[@]}"
