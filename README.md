@@ -133,7 +133,6 @@ Commands inside the chat: `/status`, `/clear`, `/provider <id|auto>`, `/test-all
 .github/
 .github/workflows/
 .github/workflows/ci.yml
-.github/workflows/docs-sync.yml
 .github/workflows/publish.yml
 scripts/
 scripts/playground.mts

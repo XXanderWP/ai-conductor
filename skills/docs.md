@@ -11,7 +11,7 @@ Keep README, AGENTS.md, and skill files accurate for humans and LLM agents.
 | `README.md`    | Hand-written intro + examples; generated block via `npm run docs:sync` |
 | `AGENTS.md`    | Hand-written agent rules; generated block via `npm run docs:sync`      |
 | `skills/*.md`  | Hand-maintained; each file must keep a self-update instruction         |
-| GitHub Actions | `.github/workflows/*` run tests, docs check, publish                   |
+| GitHub Actions | `.github/workflows/*` — CI checks docs freshness; agents run `docs:sync` locally |
 
 ## Sync workflow
 
