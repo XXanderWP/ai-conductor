@@ -22,11 +22,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node 24 ships npm >= 11.5.1 required for Trusted Publishing (OIDC).
+      # Do not set registry-url: it writes an empty _authToken and blocks OIDC.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
-          registry-url: https://registry.npmjs.org
 
       - name: Resolve package version
         id: meta
@@ -100,8 +101,6 @@ jobs:
       - name: Publish to npm
         if: ${{ steps.npm.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false) }}
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
         if: ${{ steps.release.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false) }}
