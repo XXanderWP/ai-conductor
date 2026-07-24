@@ -156,7 +156,7 @@ Commands inside the chat: `/status`, `/clear`, `/provider <id|auto>`, `/test-all
 | Field   | Value                     |
 | ------- | ------------------------- |
 | Name    | `@xxanderwp/ai-conductor` |
-| Version | `0.1.3`                   |
+| Version | `0.1.4`                   |
 | Author  | XXanderWP                 |
 | License | MIT                       |
 | Node    | >=18                      |
