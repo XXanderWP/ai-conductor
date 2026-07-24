@@ -42,7 +42,7 @@ All code, documentation, comments, commit messages in this repository, and skill
 
 ## Auto-synced project facts
 
-- Package: `@xxanderwp/ai-conductor@0.1.1`
+- Package: `@xxanderwp/ai-conductor@0.1.2`
 - Author: XXanderWP
 - License: MIT
 - Entry: `src/index.ts` → `dist/`
