@@ -26,7 +26,7 @@ Describe the technical stack, directories, scripts, and conventions for **AI Con
 | `examples/`          | Sample configs                                     |
 | `skills/`            | Agent skill markdown files                         |
 | `scripts/`           | Node maintenance scripts                           |
-| `.github/workflows/` | CI / publish                               |
+| `.github/workflows/` | CI / publish                                       |
 
 ## Essential commands
 
