@@ -15,3 +15,6 @@ coverage/
 
 # Local playground config with secrets — use config.yml.example
 /config.yml
+
+# Local graphify knowledge-graph output
+graphify-out/
