@@ -1,13 +1,37 @@
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { Conductor, normalizeConfig, PROVIDERS } from '../src/index';
+import { Conductor, isLikelyVisionModel, normalizeConfig, PROVIDERS } from '../src/index';
 import { scoreCheapest } from '../src/routing/order';
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json', ...headers },
+  });
+}
+
+function sseResponse(deltas: string[], model = 'gemini-flash-latest') {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const delta of deltas) {
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              model,
+              choices: [{ delta: { content: delta } }],
+            })}\n\n`,
+          ),
+        );
+      }
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
   });
 }
 
@@ -269,8 +293,8 @@ fallback:
     const result = await conductor.listModels('gemini');
     expect(result.ok).toBe(true);
     expect(result.models).toEqual([
-      { id: 'gemini-2.0-flash', ownedBy: 'google' },
-      { id: 'gemini-flash-latest', ownedBy: 'google' },
+      { id: 'gemini-2.0-flash', ownedBy: 'google', supportsVision: true },
+      { id: 'gemini-flash-latest', ownedBy: 'google', supportsVision: true },
     ]);
   });
 
@@ -393,5 +417,221 @@ fallback:
     expect(result.foldedCount).toBe(0);
     expect(result.summary).toBe('');
     expect(result.messages).toEqual(history);
+  });
+
+  it('streams chat deltas and resolves the final response', async () => {
+    const chunks: string[] = [];
+    const conductor = new Conductor({
+      providers: [{ id: 'gemini', apiKey: 'g', model: 'gemini-flash-latest' }],
+      fetch: async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { stream?: boolean };
+        expect(body.stream).toBe(true);
+        return sseResponse(['Пр', 'и', 'вет']);
+      },
+    });
+
+    const { result } = conductor.chatStream('hi', (text) => chunks.push(text));
+    const response = await result;
+
+    expect(chunks).toEqual(['Пр', 'и', 'вет']);
+    expect(response.content).toBe('Привет');
+    expect(response.provider).toBe('gemini');
+  });
+
+  it('can deliver cumulative text to the stream callback', async () => {
+    const chunks: string[] = [];
+    const conductor = new Conductor({
+      providers: [{ id: 'gemini', apiKey: 'g', model: 'gemini-flash-latest' }],
+      fetch: async () => sseResponse(['Пр', 'и', 'вет']),
+    });
+
+    const { result } = conductor.chatStream('hi', (text) => chunks.push(text), {
+      chunkMode: 'cumulative',
+    });
+    await result;
+
+    expect(chunks).toEqual(['Пр', 'При', 'Привет']);
+  });
+
+  it('fails over before the first stream chunk, then streams from the next provider', async () => {
+    const chunks: string[] = [];
+    const conductor = new Conductor({
+      providers: [
+        { id: 'gemini', apiKey: 'g', model: 'gemini-flash-latest', priority: 100 },
+        { id: 'groq', apiKey: 'q', model: 'llama-3.1-8b-instant', priority: 90 },
+      ],
+      routing: { strategy: 'failover' },
+      fallback: ['gemini', 'groq'],
+      fetch: async (input) => {
+        if (String(input).includes('generativelanguage')) {
+          return jsonResponse({ error: { message: 'quota' } }, 429);
+        }
+        return sseResponse(['ok']);
+      },
+    });
+
+    const { result } = conductor.chatStream('hi', (text) => chunks.push(text));
+    const response = await result;
+
+    expect(chunks).toEqual(['ok']);
+    expect(response.provider).toBe('groq');
+    expect(response.failedProviders).toEqual(['gemini']);
+  });
+
+  it('cancels an in-flight stream via the returned handle', async () => {
+    const conductor = new Conductor({
+      providers: [{ id: 'gemini', apiKey: 'g', model: 'gemini-flash-latest' }],
+      fetch: async (_input, init) => {
+        const signal = init?.signal;
+        return new Promise<Response>((_resolve, reject) => {
+          const onAbort = () => {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          };
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+          signal?.addEventListener('abort', onAbort, { once: true });
+        });
+      },
+    });
+
+    const { result, cancel } = conductor.chatStream('hi', () => undefined);
+    queueMicrotask(() => cancel());
+
+    await expect(result).rejects.toThrow(/cancelled/i);
+  });
+});
+
+describe('vision', () => {
+  function capturingFetch(content = 'a cat') {
+    const bodies: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      bodies.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+      return jsonResponse({ choices: [{ message: { content } }], model: 'm' });
+    };
+    return { bodies, fetchImpl };
+  }
+
+  it('exposes vision support per provider in the registry', () => {
+    expect(PROVIDERS.cerebras.supportsVision).toBe(false);
+    expect(PROVIDERS.gemini.supportsVision).toBe(true);
+    expect(isLikelyVisionModel('gemini', 'gemini-flash-latest')).toBe(true);
+    expect(isLikelyVisionModel('gemini', 'text-embedding-004')).toBe(false);
+    expect(isLikelyVisionModel('groq', 'llama-3.1-8b-instant')).toBe(false);
+    expect(isLikelyVisionModel('ollama', 'qwen2.5vl:7b')).toBe(true);
+    expect(isLikelyVisionModel('cerebras', 'llama-4-scout')).toBe(false);
+  });
+
+  it('reports vision capabilities for configured providers', async () => {
+    const conductor = new Conductor({
+      providers: [
+        { id: 'groq', apiKey: 'q', model: 'llama-3.1-8b-instant' },
+        { id: 'cerebras', apiKey: 'c', model: 'llama-3.3-70b' },
+      ],
+    });
+    await conductor.whenReady();
+
+    const caps = conductor.getVisionCapabilities({ configuredOnly: true });
+    expect(caps.map((c) => c.provider)).toEqual(['groq', 'cerebras']);
+    expect(caps[0]).toMatchObject({
+      supportsVision: true,
+      configured: true,
+      modelSupportsVision: false,
+      recognitionModel: PROVIDERS.groq.visionModels?.[0],
+    });
+    expect(caps[1]).toMatchObject({ supportsVision: false, recognitionModel: undefined });
+    expect(conductor.getVisionCapabilities().length).toBe(Object.keys(PROVIDERS).length);
+    expect(conductor.supportsVision('cerebras')).toBe(false);
+    expect(conductor.supportsVision('openai', 'gpt-4o-mini')).toBe(true);
+  });
+
+  it('sends image_url parts and skips providers without vision', async () => {
+    const { bodies, fetchImpl } = capturingFetch();
+    const conductor = new Conductor({
+      providers: [
+        { id: 'cerebras', apiKey: 'c', model: 'llama-3.3-70b', priority: 100 },
+        { id: 'groq', apiKey: 'q', model: 'llama-3.1-8b-instant', priority: 90 },
+      ],
+      routing: { strategy: 'priority' },
+      fetch: fetchImpl,
+    });
+
+    const response = await conductor.recognizeImage('https://example.com/cat.png', {
+      prompt: 'What is this?',
+      detail: 'low',
+    });
+
+    expect(response.provider).toBe('groq');
+    expect(response.content).toBe('a cat');
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].body.model).toBe(PROVIDERS.groq.visionModels?.[0]);
+    expect(bodies[0].body.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'What is this?' },
+          { type: 'image_url', image_url: { url: 'https://example.com/cat.png', detail: 'low' } },
+        ],
+      },
+    ]);
+  });
+
+  it('inlines bytes and local files as data URLs', async () => {
+    const { bodies, fetchImpl } = capturingFetch();
+    const conductor = new Conductor({
+      providers: [{ id: 'gemini', apiKey: 'g', model: 'gemini-flash-latest' }],
+      fetch: fetchImpl,
+    });
+    const dir = await mkdtemp(path.join(tmpdir(), 'ai-conductor-vision-'));
+    const filePath = path.join(dir, 'pixel.png');
+    await writeFile(filePath, Buffer.from([1, 2, 3]));
+
+    await conductor.recognizeImage([
+      { data: new Uint8Array([4, 5, 6]), mimeType: 'image/jpeg' },
+      filePath,
+    ]);
+
+    const parts = (bodies[0].body.messages as Array<{ content: unknown[] }>)[0].content;
+    expect(bodies[0].body.model).toBe('gemini-flash-latest');
+    expect(parts.slice(1)).toEqual([
+      { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,BAUG' } },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+    ]);
+  });
+
+  it('rejects forcing a provider without vision support', async () => {
+    const conductor = new Conductor({
+      providers: [{ id: 'cerebras', apiKey: 'c', model: 'llama-3.3-70b' }],
+      fetch: capturingFetch().fetchImpl,
+    });
+
+    await expect(
+      conductor.recognizeImage('https://example.com/a.png', { provider: 'cerebras' }),
+    ).rejects.toThrow(/does not support image inputs/);
+    await expect(conductor.recognizeImage('https://example.com/a.png')).rejects.toThrow(
+      /No vision-capable providers/,
+    );
+  });
+
+  it('filters listed models by catalog modalities', async () => {
+    const conductor = new Conductor({
+      providers: [{ id: 'openrouter', apiKey: 'o', model: 'openrouter/free' }],
+      fetch: async () =>
+        jsonResponse({
+          data: [
+            { id: 'vendor/text-model', architecture: { input_modalities: ['text'] } },
+            { id: 'vendor/eyes', architecture: { input_modalities: ['text', 'image'] } },
+          ],
+        }),
+    });
+
+    const listed = await conductor.listVisionModels('openrouter');
+    expect(listed.ok).toBe(true);
+    expect(listed.models).toEqual([
+      { id: 'vendor/eyes', inputModalities: ['text', 'image'], supportsVision: true },
+    ]);
   });
 });

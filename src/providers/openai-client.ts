@@ -1,5 +1,11 @@
 import type { ChatOptions, GenerationParams, Message, TokenUsage } from '../types.js';
-import { getFixedTemperature, PROVIDERS, resolveBaseUrl, type ProviderId } from './registry.js';
+import {
+  getFixedTemperature,
+  isLikelyVisionModel,
+  PROVIDERS,
+  resolveBaseUrl,
+  type ProviderId,
+} from './registry.js';
 
 export interface OpenAIChatSuccess {
   content: string;
@@ -66,15 +72,23 @@ function mergeParams(
   };
 }
 
-/**
- * Call an OpenAI-compatible `/chat/completions` endpoint via fetch.
- */
-export async function openaiChatCompletion(
+type PreparedChatRequest =
+  | {
+      ok: true;
+      url: string;
+      model: string;
+      headers: Record<string, string>;
+      body: Record<string, unknown>;
+      timeoutMs: number;
+    }
+  | { ok: false; error: OpenAIChatError };
+
+function prepareChatRequest(
   endpoint: ResolvedProviderEndpoint,
   messages: Message[],
-  options?: ChatOptions,
-  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
-): Promise<OpenAIChatResult> {
+  options: ChatOptions | undefined,
+  stream: boolean,
+): PreparedChatRequest {
   const meta = PROVIDERS[endpoint.id];
   const baseUrl = resolveBaseUrl(endpoint.id, endpoint.baseUrl);
   const url = `${baseUrl}/chat/completions`;
@@ -110,7 +124,7 @@ export async function openaiChatCompletion(
   const body: Record<string, unknown> = {
     model,
     messages,
-    stream: false,
+    stream,
     ...options?.metadata,
   };
   if (params.temperature !== undefined) body.temperature = params.temperature;
@@ -130,7 +144,180 @@ export async function openaiChatCompletion(
     headers['x-title'] = 'AI Conductor';
   }
 
-  const timeoutMs = options?.timeoutMs ?? 120_000;
+  return {
+    ok: true,
+    url,
+    model,
+    headers,
+    body,
+    timeoutMs: options?.timeoutMs ?? 120_000,
+  };
+}
+
+function errorMessageFromPayload(json: unknown, fallback: string): string {
+  const errObj = json && typeof json === 'object' ? (json as Record<string, unknown>) : {};
+  if (
+    errObj.error &&
+    typeof errObj.error === 'object' &&
+    typeof (errObj.error as { message?: unknown }).message === 'string'
+  ) {
+    return (errObj.error as { message: string }).message;
+  }
+  if (typeof errObj.message === 'string') return errObj.message;
+  return fallback;
+}
+
+function toHttpError(
+  status: number,
+  message: string,
+  headers: Record<string, string>,
+): OpenAIChatError {
+  const rateLimited = status === 429 || /rate.?limit|resource.?exhausted/i.test(message);
+  return {
+    status,
+    message,
+    retryAfterSec: parseRetryAfterSeconds(headers),
+    headers,
+    rateLimited,
+    retryable: rateLimited || status >= 500,
+  };
+}
+
+function abortErrorMessage(
+  error: unknown,
+  timeoutMs: number,
+  externalSignal?: AbortSignal,
+): string {
+  if (externalSignal?.aborted) return 'Request cancelled';
+  if (error instanceof Error && error.name === 'AbortError') {
+    return `Request timed out after ${timeoutMs}ms`;
+  }
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function attachAbortBridge(
+  externalSignal: AbortSignal | undefined,
+  controller: AbortController,
+): () => void {
+  if (!externalSignal) return () => undefined;
+  if (externalSignal.aborted) {
+    controller.abort();
+    return () => undefined;
+  }
+  const onAbort = () => controller.abort();
+  externalSignal.addEventListener('abort', onAbort, { once: true });
+  return () => externalSignal.removeEventListener('abort', onAbort);
+}
+
+interface SseStreamParseResult {
+  content: string;
+  model?: string;
+  usage?: TokenUsage;
+  rawChunks: unknown[];
+  /** True once at least one non-empty content delta was delivered to onDelta. */
+  emitted: boolean;
+}
+
+/**
+ * Read an OpenAI-compatible SSE chat stream and invoke `onDelta` for each content piece.
+ */
+async function readSseChatStream(
+  body: ReadableStream<Uint8Array>,
+  onDelta: (delta: string) => void,
+  signal?: AbortSignal,
+): Promise<SseStreamParseResult> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  let model: string | undefined;
+  let usage: TokenUsage | undefined;
+  const rawChunks: unknown[] = [];
+  let emitted = false;
+
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      const err = new Error('Request cancelled');
+      err.name = 'AbortError';
+      throw err;
+    }
+  };
+
+  try {
+    while (true) {
+      throwIfAborted();
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(':')) continue;
+        if (!trimmed.startsWith('data:')) continue;
+
+        const data = trimmed.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+
+        let json: unknown;
+        try {
+          json = JSON.parse(data);
+        } catch {
+          continue;
+        }
+
+        rawChunks.push(json);
+        const obj = json as {
+          model?: string;
+          choices?: Array<{ delta?: { content?: string | null } }>;
+          usage?: {
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            total_tokens?: number;
+          };
+        };
+
+        if (typeof obj.model === 'string' && obj.model) model = obj.model;
+
+        const delta = obj.choices?.[0]?.delta?.content;
+        if (typeof delta === 'string' && delta.length > 0) {
+          content += delta;
+          emitted = true;
+          onDelta(delta);
+        }
+
+        if (obj.usage) {
+          usage = {
+            promptTokens: obj.usage.prompt_tokens,
+            completionTokens: obj.usage.completion_tokens,
+            totalTokens: obj.usage.total_tokens,
+          };
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return { content, model, usage, rawChunks, emitted };
+}
+
+/**
+ * Call an OpenAI-compatible `/chat/completions` endpoint via fetch.
+ */
+export async function openaiChatCompletion(
+  endpoint: ResolvedProviderEndpoint,
+  messages: Message[],
+  options?: ChatOptions,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<OpenAIChatResult> {
+  const prepared = prepareChatRequest(endpoint, messages, options, false);
+  if (!prepared.ok) return prepared;
+
+  const { url, model, headers, body, timeoutMs } = prepared;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -152,29 +339,13 @@ export async function openaiChatCompletion(
     }
 
     if (!response.ok) {
-      const errObj = json && typeof json === 'object' ? (json as Record<string, unknown>) : {};
-      const errMsg =
-        (errObj.error &&
-          typeof errObj.error === 'object' &&
-          typeof (errObj.error as { message?: unknown }).message === 'string' &&
-          (errObj.error as { message: string }).message) ||
-        (typeof errObj.message === 'string' && errObj.message) ||
-        text ||
-        response.statusText;
-
-      const rateLimited =
-        response.status === 429 || /rate.?limit|resource.?exhausted/i.test(String(errMsg));
-
       return {
         ok: false,
-        error: {
-          status: response.status,
-          message: String(errMsg),
-          retryAfterSec: parseRetryAfterSeconds(responseHeaders),
-          headers: responseHeaders,
-          rateLimited,
-          retryable: rateLimited || response.status >= 500,
-        },
+        error: toHttpError(
+          response.status,
+          errorMessageFromPayload(json, text || response.statusText),
+          responseHeaders,
+        ),
       };
     }
 
@@ -220,17 +391,11 @@ export async function openaiChatCompletion(
       },
     };
   } catch (error) {
-    const message =
-      error instanceof Error
-        ? error.name === 'AbortError'
-          ? `Request timed out after ${timeoutMs}ms`
-          : error.message
-        : String(error);
     return {
       ok: false,
       error: {
         status: 0,
-        message,
+        message: abortErrorMessage(error, timeoutMs),
         headers: {},
         rateLimited: false,
         retryable: true,
@@ -241,10 +406,173 @@ export async function openaiChatCompletion(
   }
 }
 
+export interface OpenAIChatStreamSuccess extends OpenAIChatSuccess {
+  /** True when at least one non-empty content delta was emitted to `onDelta`. */
+  emitted: boolean;
+}
+
+export type OpenAIChatStreamResult =
+  | { ok: true; data: OpenAIChatStreamSuccess }
+  | { ok: false; error: OpenAIChatError; emitted: boolean };
+
+/**
+ * Stream an OpenAI-compatible `/chat/completions` response (SSE).
+ * Invokes `onDelta` for each content piece as it arrives.
+ */
+export async function openaiChatCompletionStream(
+  endpoint: ResolvedProviderEndpoint,
+  messages: Message[],
+  onDelta: (delta: string) => void,
+  options?: ChatOptions,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  externalSignal?: AbortSignal,
+): Promise<OpenAIChatStreamResult> {
+  const prepared = prepareChatRequest(endpoint, messages, options, true);
+  if (!prepared.ok) return { ...prepared, emitted: false };
+
+  const { url, model, headers, body, timeoutMs } = prepared;
+  const controller = new AbortController();
+  const detachExternal = attachAbortBridge(externalSignal, controller);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let emitted = false;
+
+  try {
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const responseHeaders = flattenHeaders(response.headers);
+
+    if (!response.ok) {
+      const text = await response.text();
+      let json: unknown;
+      try {
+        json = text ? JSON.parse(text) : undefined;
+      } catch {
+        json = undefined;
+      }
+
+      return {
+        ok: false,
+        emitted: false,
+        error: toHttpError(
+          response.status,
+          errorMessageFromPayload(json, text || response.statusText),
+          responseHeaders,
+        ),
+      };
+    }
+
+    if (!response.body) {
+      return {
+        ok: false,
+        emitted: false,
+        error: {
+          status: response.status,
+          message: 'Provider returned an empty stream body.',
+          headers: responseHeaders,
+          rateLimited: false,
+          retryable: true,
+        },
+      };
+    }
+
+    const parsed = await readSseChatStream(response.body, onDelta, controller.signal);
+    emitted = parsed.emitted;
+
+    if (!parsed.content) {
+      return {
+        ok: false,
+        emitted,
+        error: {
+          status: response.status,
+          message: 'Provider returned no message content.',
+          headers: responseHeaders,
+          rateLimited: false,
+          retryable: !emitted,
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      data: {
+        content: parsed.content,
+        model: parsed.model ?? model,
+        usage: parsed.usage,
+        headers: responseHeaders,
+        status: response.status,
+        raw: parsed.rawChunks,
+        emitted,
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      emitted,
+      error: {
+        status: 0,
+        message: abortErrorMessage(error, timeoutMs, externalSignal),
+        headers: {},
+        rateLimited: false,
+        retryable: !emitted && !externalSignal?.aborted,
+      },
+    };
+  } finally {
+    clearTimeout(timer);
+    detachExternal();
+  }
+}
+
 /** Model entry from `GET /models` (OpenAI-compatible). */
 export interface OpenAIModelInfo {
   id: string;
   ownedBy?: string;
+  /** Input modalities from catalog metadata, when the provider reports them. */
+  inputModalities?: string[];
+  /** Catalog metadata when available, otherwise {@link isLikelyVisionModel}. */
+  supportsVision?: boolean;
+}
+
+function readStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = value.filter((v): v is string => typeof v === 'string').map((v) => v.toLowerCase());
+  return out.length ? out : undefined;
+}
+
+/**
+ * Extract input modalities from common catalog shapes:
+ * OpenRouter `architecture.input_modalities`, plain `input_modalities` / `modalities`.
+ */
+function parseInputModalities(item: Record<string, unknown>): string[] | undefined {
+  const architecture = item.architecture;
+  if (architecture && typeof architecture === 'object') {
+    const fromArch = readStringArray((architecture as Record<string, unknown>).input_modalities);
+    if (fromArch) return fromArch;
+  }
+  const direct = readStringArray(item.input_modalities);
+  if (direct) return direct;
+  const modalities = item.modalities;
+  if (modalities && typeof modalities === 'object' && !Array.isArray(modalities)) {
+    return readStringArray((modalities as Record<string, unknown>).input);
+  }
+  return readStringArray(modalities);
+}
+
+function withVision(
+  provider: ProviderId,
+  info: { id: string; ownedBy?: string },
+  inputModalities?: string[],
+): OpenAIModelInfo {
+  const supportsVision = !PROVIDERS[provider].supportsVision
+    ? false
+    : inputModalities
+      ? inputModalities.includes('image')
+      : isLikelyVisionModel(provider, info.id);
+  return { ...info, ...(inputModalities ? { inputModalities } : {}), supportsVision };
 }
 
 export type OpenAIListModelsResult =
@@ -279,10 +607,16 @@ function parseOpenAIModelsPayload(provider: ProviderId, json: unknown): OpenAIMo
     const rawId = (item as { id?: unknown }).id;
     if (typeof rawId !== 'string' || !rawId.trim()) continue;
     const ownedBy = (item as { owned_by?: unknown }).owned_by;
-    models.push({
-      id: normalizeProviderModelId(provider, rawId),
-      ownedBy: typeof ownedBy === 'string' ? ownedBy : undefined,
-    });
+    models.push(
+      withVision(
+        provider,
+        {
+          id: normalizeProviderModelId(provider, rawId),
+          ownedBy: typeof ownedBy === 'string' ? ownedBy : undefined,
+        },
+        parseInputModalities(item as Record<string, unknown>),
+      ),
+    );
   }
 
   return models;
@@ -331,10 +665,13 @@ async function listPuterModels(
       if (seen.has(id)) continue;
       seen.add(id);
       const provider = (item as { provider?: unknown }).provider;
-      models.push({
-        id,
-        ownedBy: typeof provider === 'string' ? provider : 'puter',
-      });
+      models.push(
+        withVision(
+          'puter',
+          { id, ownedBy: typeof provider === 'string' ? provider : 'puter' },
+          parseInputModalities(item as Record<string, unknown>),
+        ),
+      );
     }
 
     return { ok: true, models };
@@ -388,7 +725,7 @@ async function listOllamaNativeTags(
         const name =
           item && typeof item === 'object' ? (item as { name?: unknown }).name : undefined;
         if (typeof name === 'string' && name.trim()) {
-          models.push({ id: name.trim(), ownedBy: 'ollama' });
+          models.push(withVision('ollama', { id: name.trim(), ownedBy: 'ollama' }));
         }
       }
     }

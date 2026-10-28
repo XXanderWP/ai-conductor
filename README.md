@@ -37,6 +37,21 @@ const response = await conductor.chat([
 console.log(response.content, response.provider, response.strategy);
 ```
 
+### Streaming
+
+```ts
+const { result, cancel } = conductor.chatStream(
+  'Write a short poem',
+  (text) => process.stdout.write(text), // delta chunks by default
+);
+
+// Or cumulative text so far:
+// conductor.chatStream(prompt, onChunk, { chunkMode: 'cumulative' });
+
+const response = await result;
+// cancel() aborts the in-flight stream
+```
+
 Or configure entirely in code:
 
 ```ts
@@ -124,6 +139,55 @@ const { messages } = await conductor.compressContext(history, {
 // messages[0] is a system note about earlier turns; the rest is the recent tail
 ```
 
+## Image recognition (vision)
+
+```ts
+// Describe / analyze images: URL, data: URL, local file path, or { data, mimeType }
+const { content, provider, model } = await conductor.recognizeImage('./receipt.jpg', {
+  prompt: 'Extract the total amount.',
+  detail: 'high', // optional OpenAI-style hint
+});
+
+// Several images in one request
+await conductor.recognizeImage([
+  'https://example.com/a.png',
+  { data: pngBytes, mimeType: 'image/png' },
+]);
+
+// Images also work in regular chat via OpenAI-compatible content parts
+await conductor.chat([
+  {
+    role: 'user',
+    content: [
+      { type: 'text', text: 'What is on this picture?' },
+      { type: 'image_url', image_url: { url: 'https://example.com/cat.jpg' } },
+    ],
+  },
+]);
+```
+
+`recognizeImage` follows the routing strategy but skips providers without image input. Per provider it uses `options.model`, else the configured model if it supports vision, else the first registry `visionModels` entry.
+
+Which provider / model supports images:
+
+```ts
+conductor.getVisionCapabilities(); // every built-in provider
+conductor.getVisionCapabilities({ configuredOnly: true });
+// → [{ provider: 'groq', supportsVision: true, visionModels: [...], configured: true,
+//      model: 'llama-3.1-8b-instant', modelSupportsVision: false,
+//      recognitionModel: 'meta-llama/llama-4-scout-17b-16e-instruct' }, ...]
+
+conductor.supportsVision('cerebras'); // false
+conductor.supportsVision('openai', 'gpt-4o-mini'); // true (heuristic)
+
+// Live catalog filtered to image-capable models (uses catalog modalities when reported,
+// e.g. OpenRouter; name heuristics otherwise). listModels() also sets `supportsVision`.
+await conductor.listVisionModels('openrouter');
+await conductor.listVisionModels();
+```
+
+Static metadata is also on `PROVIDERS[id].supportsVision` / `visionModels`, and `isLikelyVisionModel(provider, model)` is exported.
+
 ## Development
 
 ```bash
@@ -192,6 +256,7 @@ src/types.ts
 src/utils/
 src/utils/suggest.ts
 src/utils.ts
+src/vision.ts
 tests/
 tests/conductor.test.ts
 tests/suggest.test.ts

@@ -12,6 +12,7 @@ export {
   isLikelyFreeModel,
   resolveBaseUrl,
   getFixedTemperature,
+  isLikelyVisionModel,
 } from './providers/registry.js';
 export type { ProviderId, ProviderMeta, RateLimitHint } from './providers/registry.js';
 export { loadConfigFile, normalizeConfig, mergeConfig, resolveApiKey } from './config/load.js';
@@ -21,13 +22,25 @@ export type {
   ProviderConfig,
   RoutingConfig,
 } from './config/types.js';
-export { normalizeMessages, toPrompt } from './utils.js';
+export { normalizeMessages, toPrompt, messageText } from './utils.js';
+export { toImageContentPart, imageMimeTypeFromPath } from './vision.js';
 export { suggestClosest, formatSuggestions } from './utils/suggest.js';
 export type {
   Message,
   MessageRole,
+  MessageContentPart,
+  TextContentPart,
+  ImageContentPart,
+  ImageDetail,
+  ImageInput,
+  RecognizeImageOptions,
+  VisionCapability,
   ChatOptions,
   ChatResponse,
+  ChatStreamOptions,
+  ChatStreamHandle,
+  ChatStreamChunkCallback,
+  StreamChunkMode,
   RoutingStrategy,
   GenerationParams,
   TokenUsage,
