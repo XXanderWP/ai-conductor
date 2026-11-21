@@ -52,6 +52,21 @@ const response = await result;
 // cancel() aborts the in-flight stream
 ```
 
+Stream options (all optional):
+
+| Option           | Default  | Meaning                                                                                           |
+| ---------------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `chunkMode`      | `delta`  | `delta` pieces or `cumulative` text so far                                                        |
+| `timeoutMs`      | `120000` | Wait for response **headers**                                                                     |
+| `idleTimeoutMs`  | `60000`  | Abort when no bytes arrive for this long (keep-alive comments and reasoning count); `0` disables  |
+| `totalTimeoutMs` | `300000` | Hard limit for the whole stream; `0` disables                                                     |
+| `onReasoning`    | —        | Reasoning deltas (`reasoning`, `reasoning_content`, `reasoning_details`, stripped `<think>` text) |
+| `onActivity`     | —        | `'reasoning' \| 'text' \| 'tool'` for every chunk of that kind (e.g. a "thinking…" indicator)     |
+| `stripThinking`  | `false`  | Remove `<think>…</think>` from `content` and streamed text (an unclosed block stays hidden)       |
+| `onToolCall`     | —        | Each finished tool call, once, when the stream ends                                               |
+
+A watchdog abort rejects with `ConductorError` `code: 'stalled'` and `partialContent` (text received so far); a user abort (`cancel()` or `signal`) rejects with `code: 'aborted'`. Usage is filled for streams too: providers with `supportsStreamUsage` get `stream_options: { include_usage: true }`.
+
 Or configure entirely in code:
 
 ```ts
@@ -267,6 +282,82 @@ await conductor.listVisionModels();
 
 Static metadata is also on `PROVIDERS[id].supportsVision` / `visionModels`, and `isLikelyVisionModel(provider, model)` is exported.
 
+## Embedding in a host app
+
+When a host app (e.g. an Electron main process) keeps its own routing, quotas and context compaction, use AI Conductor as a per-profile transport:
+
+```ts
+import { Conductor, isConductorError } from '@xxanderwp/ai-conductor';
+
+const conductor = new Conductor({
+  env: false, // never read GEMINI_API_KEY etc. from the user's environment; `${VAR}` stays as is
+  providers: [
+    // Several profiles of one provider type: `id` is a free-form instance id
+    { id: 'gemini-work', provider: 'gemini', apiKey: workKey, model: 'gemini-flash-latest' },
+    { id: 'gemini-home', provider: 'gemini', apiKey: homeKey, model: 'gemini-flash-latest' },
+    {
+      id: 'gateway',
+      provider: 'openai_compatible',
+      baseUrl: 'http://localhost:8080/v1',
+      model: 'local',
+    }, // anonymous: no Authorization header
+  ],
+  onResponse: (e) => {
+    // after every HTTP attempt: persist quotas / headers in the host
+    quotas.record(e.provider, {
+      status: e.status,
+      headers: e.headers,
+      usage: e.usage,
+      ms: e.durationMs,
+    });
+  },
+  usageStore: myPersistentStore, // optional: { get(id), set(id, state), delete?(id) }
+});
+
+const controller = new AbortController();
+try {
+  const res = await conductor.chat(history, {
+    provider: 'gemini-work',
+    fallback: false, // exactly this instance, once: no strategy, no fallback list, no retries
+    signal: controller.signal,
+    headers: { 'x-request-id': requestId },
+    extraBody: { safety_settings: [] }, // merged into the body last
+    reasoningEffort: 'low', // sent only where supportsReasoningEffort
+  });
+  console.log(res.provider, res.providerType, res.model, res.usage, res.headers);
+} catch (error) {
+  if (isConductorError(error)) {
+    switch (error.code) {
+      case 'rate_limited':
+        cooldown(error.provider, error.retryAfterSec);
+        break;
+      case 'context_overflow':
+        await compactHistory();
+        break;
+      case 'auth':
+        markKeyInvalid(error.provider);
+        break;
+      case 'aborted':
+        break;
+      default:
+        log(error.code, error.status, error.message, error.body, error.attempts);
+    }
+  }
+}
+
+// Swap profiles at runtime; counters of surviving instance ids are kept
+await conductor.updateConfig({ providers: nextProfiles, apiKeys: nextKeys });
+```
+
+- **Instances:** `{ id, provider }` entries; `options.provider`, `fallback`, `apiKeys`, `dailyLimit`, usage counters and `listModels` / `testProvider` all take the instance id. `ChatResponse.provider` is the instance id, `providerType` the registry id. Duplicate ids are a config error.
+- **`fallback: false`** calls exactly one instance once. `retries: n` (any mode) retries the same instance on retryable errors. A requested instance over its `dailyLimit` rejects with `code: 'daily_limit'`.
+- **`ConductorError`** (`chat`, `chatStream().result`, config errors): `code` is one of `http`, `rate_limited`, `context_overflow`, `aborted`, `stalled`, `timeout`, `network`, `auth`, `daily_limit`, `config`, `no_provider`; plus `status`, `provider`, `providerType`, `model`, `retryAfterSec` (`Retry-After`, `retry-after-ms`, exhausted `x-ratelimit-reset-*`, Gemini `RetryInfo`), `headers`, `body`, `partialContent`, `attempts`.
+- **`signal`** works for `chat`, `chatStream`, `listModels`, `testProvider`, `compressContext`, `recognizeImage`; listeners are removed when the request ends.
+- **`env`**: `true` (default) = `process.env`, `false` = no env lookup and no `${VAR}` expansion (placeholders are left unexpanded), or an explicit `{ NAME: value }` map.
+- **Headers / body:** `ProviderConfig.headers` and `ChatOptions.headers` (request wins) override built-in defaults such as OpenRouter `HTTP-Referer`. `metadata` is spread right after `model` / `messages`; `extraBody` is merged last and overrides everything.
+- **Catalog:** `listModels` adds `contextLength`, `supportsTools` and `isFree` when the catalog reports them; `{ details: true }` also sets `isFree` from the `isLikelyFreeModel` heuristic and `raw`. `detectOllama(baseUrl?, { timeoutMs, signal })` checks a local Ollama server.
+- `parseRateLimitHeaders(headers)` → `{ remainingRequests, remainingTokens, resetRequestsMs, resetTokensMs, retryAfterSec }`.
+
 ## Development
 
 ```bash
@@ -299,7 +390,7 @@ Commands inside the chat: `/status`, `/clear`, `/provider <id|auto>`, `/test-all
 | Field   | Value                     |
 | ------- | ------------------------- |
 | Name    | `@xxanderwp/ai-conductor` |
-| Version | `0.2.0`                   |
+| Version | `0.3.0`                   |
 | Author  | XXanderWP                 |
 | License | MIT                       |
 | Node    | >=18                      |
@@ -323,14 +414,17 @@ src/conductor.ts
 src/config/
 src/config/load.ts
 src/config/types.ts
+src/errors.ts
 src/index.ts
 src/providers/
 src/providers/mock.ts
 src/providers/openai-client.ts
 src/providers/registry.ts
+src/ratelimit.ts
 src/routing/
 src/routing/order.ts
 src/routing/usage.ts
+src/think.ts
 src/types.ts
 src/utils/
 src/utils/suggest.ts
@@ -338,6 +432,7 @@ src/utils.ts
 src/vision.ts
 tests/
 tests/conductor.test.ts
+tests/embedding.test.ts
 tests/suggest.test.ts
 tests/tools.test.ts
 tests/types-compat.test.ts

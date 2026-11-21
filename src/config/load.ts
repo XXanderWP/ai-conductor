@@ -1,7 +1,14 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import type { ConductorConfig, ConductorInitOptions, ProviderConfig } from './types.js';
+import type {
+  ConductorConfig,
+  ConductorInitOptions,
+  EnvSource,
+  NormalizedConductorConfig,
+  ProviderInstanceConfig,
+} from './types.js';
+import { ConductorError } from '../errors.js';
 import { isProviderId, PROVIDERS, type ProviderId } from '../providers/registry.js';
 import type { GenerationParams, RoutingStrategy } from '../types.js';
 
@@ -13,12 +20,36 @@ const ROUTING_STRATEGIES: RoutingStrategy[] = [
   'first-available',
 ];
 
-/** Expand `${VAR}` / `$VAR` placeholders from `process.env`. */
-export function interpolateEnv(value: string): string {
+/** Options shared by config loading helpers. */
+export interface ConfigEnvOptions {
+  /** Env source (default `true` = `process.env`; `false` = no lookup, placeholders kept). */
+  env?: EnvSource;
+}
+
+/** Resolve an {@link EnvSource} to a lookup map, or `undefined` when env access is disabled. */
+export function resolveEnv(
+  env: EnvSource | undefined,
+): Record<string, string | undefined> | undefined {
+  if (env === false) return undefined;
+  if (env === undefined || env === true) return process.env;
+  return env;
+}
+
+/**
+ * Expand `${VAR}` / `$VAR` placeholders from `process.env` (or `options.env`).
+ * With `env: false` the value is returned unchanged.
+ */
+export function interpolateEnv(value: string, options?: ConfigEnvOptions): string {
+  const source = resolveEnv(options?.env);
+  if (!source) return value;
   return value.replace(/\$\{([A-Z0-9_]+)\}|\$([A-Z0-9_]+)/gi, (_, braced, bare) => {
     const key = (braced ?? bare) as string;
-    return process.env[key] ?? '';
+    return source[key] ?? '';
   });
+}
+
+function configError(message: string): ConductorError {
+  return new ConductorError(message, { code: 'config' });
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -41,21 +72,55 @@ function normalizeParams(raw: unknown): GenerationParams | undefined {
   return Object.keys(out).length ? out : undefined;
 }
 
-function normalizeProvider(raw: unknown, index: number): ProviderConfig {
+function normalizeHeaders(
+  raw: unknown,
+  options?: ConfigEnvOptions,
+): Record<string, string> | undefined {
+  const src = asRecord(raw);
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(src)) {
+    if (typeof value === 'string') out[key.toLowerCase()] = interpolateEnv(value, options);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function normalizeProvider(
+  raw: unknown,
+  index: number,
+  options?: ConfigEnvOptions,
+): ProviderInstanceConfig {
   const src = asRecord(raw);
   const id = src.id;
-  if (!isProviderId(id)) {
-    throw new Error(
-      `Invalid provider id at providers[${index}]: ${String(id)}. Known: ${Object.keys(PROVIDERS).join(', ')}`,
-    );
+  const known = Object.keys(PROVIDERS).join(', ');
+  let provider: ProviderId;
+  if (src.provider !== undefined) {
+    if (!isProviderId(src.provider)) {
+      throw configError(
+        `Invalid provider type at providers[${index}].provider: ${String(src.provider)}. Known: ${known}`,
+      );
+    }
+    if (typeof id !== 'string' || !id.trim()) {
+      throw configError(`providers[${index}].id must be a non-empty instance id.`);
+    }
+    provider = src.provider;
+  } else {
+    if (!isProviderId(id)) {
+      throw configError(
+        `Invalid provider id at providers[${index}]: ${String(id)}. Known: ${known} (or set \`provider\` to use a custom instance id).`,
+      );
+    }
+    provider = id;
   }
 
-  const apiKey = typeof src.apiKey === 'string' ? interpolateEnv(src.apiKey) : undefined;
-  const model = typeof src.model === 'string' ? interpolateEnv(src.model) : undefined;
-  const baseUrl = typeof src.baseUrl === 'string' ? interpolateEnv(src.baseUrl) : undefined;
+  const apiKey = typeof src.apiKey === 'string' ? interpolateEnv(src.apiKey, options) : undefined;
+  const model = typeof src.model === 'string' ? interpolateEnv(src.model, options) : undefined;
+  const baseUrl =
+    typeof src.baseUrl === 'string' ? interpolateEnv(src.baseUrl, options) : undefined;
+  const flag = (value: unknown) => (typeof value === 'boolean' ? value : undefined);
 
   return {
-    id,
+    id: (id as string).trim(),
+    provider,
     priority: typeof src.priority === 'number' ? src.priority : undefined,
     dailyLimit: typeof src.dailyLimit === 'number' ? Math.floor(src.dailyLimit) : undefined,
     apiKey: apiKey || undefined,
@@ -64,8 +129,26 @@ function normalizeProvider(raw: unknown, index: number): ProviderConfig {
     enabled: src.enabled === false ? false : true,
     isPaid: src.isPaid === true,
     params: normalizeParams(src.params),
-    supportsTools: typeof src.supportsTools === 'boolean' ? src.supportsTools : undefined,
+    supportsTools: flag(src.supportsTools),
+    headers: normalizeHeaders(src.headers, options),
+    supportsReasoningEffort: flag(src.supportsReasoningEffort),
+    supportsStreamUsage: flag(src.supportsStreamUsage),
   };
+}
+
+function normalizeProviders(list: unknown[], options?: ConfigEnvOptions): ProviderInstanceConfig[] {
+  return assertUniqueIds(list.map((p, i) => normalizeProvider(p, i, options)));
+}
+
+function assertUniqueIds(providers: ProviderInstanceConfig[]): ProviderInstanceConfig[] {
+  const seen = new Set<string>();
+  for (const entry of providers) {
+    if (seen.has(entry.id)) {
+      throw configError(`Duplicate provider instance id "${entry.id}" in \`providers\`.`);
+    }
+    seen.add(entry.id);
+  }
+  return providers;
 }
 
 function normalizeStrategy(raw: unknown): RoutingStrategy {
@@ -76,13 +159,16 @@ function normalizeStrategy(raw: unknown): RoutingStrategy {
 }
 
 /** Normalize a raw YAML/JSON object into {@link ConductorConfig}. */
-export function normalizeConfig(raw: unknown): ConductorConfig {
+export function normalizeConfig(
+  raw: unknown,
+  options?: ConfigEnvOptions,
+): NormalizedConductorConfig {
   const src = asRecord(raw);
   if (!Array.isArray(src.providers) || src.providers.length === 0) {
-    throw new Error('Config must declare at least one entry in `providers`.');
+    throw configError('Config must declare at least one entry in `providers`.');
   }
 
-  const providers = src.providers.map((p, i) => normalizeProvider(p, i));
+  const providers = normalizeProviders(src.providers, options);
   const routingRaw = asRecord(src.routing);
   const defaultsRaw = asRecord(src.defaults);
 
@@ -104,11 +190,14 @@ export function normalizeConfig(raw: unknown): ConductorConfig {
 }
 
 /** Load and parse a YAML config file from disk. */
-export async function loadConfigFile(configPath: string): Promise<ConductorConfig> {
+export async function loadConfigFile(
+  configPath: string,
+  options?: ConfigEnvOptions,
+): Promise<NormalizedConductorConfig> {
   const absolute = path.resolve(configPath);
   const text = await readFile(absolute, 'utf8');
   const parsed = parseYaml(text);
-  return normalizeConfig(parsed);
+  return normalizeConfig(parsed, options);
 }
 
 /**
@@ -118,19 +207,22 @@ export async function loadConfigFile(configPath: string): Promise<ConductorConfi
 export function mergeConfig(
   fileConfig: ConductorConfig | undefined,
   init: ConductorInitOptions,
-): ConductorConfig {
+): NormalizedConductorConfig {
   const base: ConductorConfig = fileConfig ?? {
     providers: [],
     routing: { strategy: 'cheapest' },
   };
+  const envOptions = { env: init.env };
 
   const providers =
     init.providers && init.providers.length > 0
-      ? init.providers.map((p, i) => normalizeProvider(p, i))
-      : base.providers;
+      ? normalizeProviders(init.providers, envOptions)
+      : assertUniqueIds(
+          base.providers.map((p) => ({ ...p, provider: p.provider ?? (p.id as ProviderId) })),
+        );
 
   if (providers.length === 0) {
-    throw new Error('No providers configured. Pass `configPath` or `providers` to Conductor.');
+    throw configError('No providers configured. Pass `configPath` or `providers` to Conductor.');
   }
 
   return {
@@ -164,27 +256,46 @@ const ENV_ALIASES: Partial<Record<ProviderId, string[]>> = {
   openai_compatible: ['OPENAI_API_KEY'],
 };
 
-/** Resolve an API key from config, init map, or environment. */
+/** Options for {@link resolveApiKey}. */
+export interface ResolveApiKeyOptions extends ConfigEnvOptions {
+  /** Instance id; looked up in `apiKeys` / `AI_CONDUCTOR_<ID>_API_KEY` before the type. */
+  instanceId?: string;
+}
+
+function envKeyName(id: string): string {
+  return `AI_CONDUCTOR_${id.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`;
+}
+
+/**
+ * Resolve an API key from config, the init `apiKeys` map (instance id, then provider type),
+ * or the environment (skipped with `env: false`).
+ */
 export function resolveApiKey(
   provider: ProviderId,
   fromConfig?: string,
   apiKeys?: ConductorInitOptions['apiKeys'],
+  options?: ResolveApiKeyOptions,
 ): string {
   if (fromConfig?.trim()) {
     return fromConfig.trim();
   }
-  const fromMap = apiKeys?.[provider]?.trim();
-  if (fromMap) {
-    return fromMap;
+  const instanceId = options?.instanceId;
+  const ids = instanceId && instanceId !== provider ? [instanceId, provider] : [provider];
+  for (const id of ids) {
+    const fromMap = apiKeys?.[id]?.trim();
+    if (fromMap) return fromMap;
   }
 
-  const specific = process.env[`AI_CONDUCTOR_${provider.toUpperCase()}_API_KEY`]?.trim();
-  if (specific) {
-    return specific;
+  const env = resolveEnv(options?.env);
+  if (!env) return '';
+
+  for (const id of ids) {
+    const specific = env[envKeyName(id)]?.trim();
+    if (specific) return specific;
   }
 
   for (const alias of ENV_ALIASES[provider] ?? []) {
-    const value = process.env[alias]?.trim();
+    const value = env[alias]?.trim();
     if (value) {
       return value;
     }

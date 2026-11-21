@@ -1,10 +1,10 @@
-import type { ProviderConfig } from '../config/types.js';
+import type { AnyProviderConfig, ProviderInstanceConfig } from '../config/types.js';
 import { isLikelyFreeModel, PROVIDERS, type ProviderId } from '../providers/registry.js';
 import type { RoutingStrategy } from '../types.js';
 import type { DailyUsageTracker } from './usage.js';
 
 export interface RankedProvider {
-  config: ProviderConfig;
+  config: ProviderInstanceConfig;
   score: number;
 }
 
@@ -12,31 +12,38 @@ function defaultPriority(id: ProviderId): number {
   return 1000 - PROVIDERS[id].autoPriority * 10;
 }
 
-function effectivePriority(config: ProviderConfig): number {
-  return config.priority ?? defaultPriority(config.id);
+/** Provider type of an entry (`provider`, else the built-in `id`). */
+function providerType(config: AnyProviderConfig): ProviderId {
+  return config.provider ?? (config.id as ProviderId);
 }
 
-function looksCheap(config: ProviderConfig): boolean {
+function effectivePriority(config: AnyProviderConfig): number {
+  return config.priority ?? defaultPriority(providerType(config));
+}
+
+function looksCheap(config: AnyProviderConfig): boolean {
   if (config.isPaid) return false;
-  const meta = PROVIDERS[config.id];
+  const type = providerType(config);
+  const meta = PROVIDERS[type];
   const model = config.model ?? meta.suggestedModels?.[0] ?? '';
   if (!model) return meta.defaultFree;
-  return isLikelyFreeModel(config.id, model);
+  return isLikelyFreeModel(type, model);
 }
 
 /**
  * Score a provider for the `cheapest` strategy (higher = better).
  * Prefers free-tier providers, then config priority, then registry autoPriority.
  */
-export function scoreCheapest(config: ProviderConfig): number {
+export function scoreCheapest(config: AnyProviderConfig): number {
+  const meta = PROVIDERS[providerType(config)];
   let score = effectivePriority(config);
   if (looksCheap(config)) score += 10_000;
-  if (PROVIDERS[config.id].defaultFree && !config.isPaid) score += 1_000;
-  score -= PROVIDERS[config.id].autoPriority;
+  if (meta.defaultFree && !config.isPaid) score += 1_000;
+  score -= meta.autoPriority;
   return score;
 }
 
-export function scorePriority(config: ProviderConfig): number {
+export function scorePriority(config: AnyProviderConfig): number {
   return effectivePriority(config);
 }
 
@@ -44,13 +51,13 @@ export function scorePriority(config: ProviderConfig): number {
  * Build an ordered candidate list according to strategy, then append unique fallback ids.
  */
 export function orderProviders(options: {
-  providers: ProviderConfig[];
+  providers: ProviderInstanceConfig[];
   strategy: RoutingStrategy;
   fallback?: string[];
   usage: DailyUsageTracker;
   roundRobinIndex: number;
   forcedId?: string;
-}): { ordered: ProviderConfig[]; nextRoundRobinIndex: number } {
+}): { ordered: ProviderInstanceConfig[]; nextRoundRobinIndex: number } {
   const enabled = options.providers.filter((p) => p.enabled !== false);
   const available = enabled.filter((p) => !options.usage.isExhausted(p.id, p.dailyLimit));
 
@@ -64,7 +71,7 @@ export function orderProviders(options: {
     return { ordered: [forced], nextRoundRobinIndex: options.roundRobinIndex };
   }
 
-  let primary: ProviderConfig[] = [];
+  let primary: ProviderInstanceConfig[] = [];
   let nextRoundRobinIndex = options.roundRobinIndex;
 
   switch (options.strategy) {
@@ -94,9 +101,9 @@ export function orderProviders(options: {
   }
 
   const seen = new Set(primary.map((p) => p.id));
-  const fallbackConfigs: ProviderConfig[] = [];
+  const fallbackConfigs: ProviderInstanceConfig[] = [];
   for (const id of options.fallback ?? []) {
-    if (seen.has(id as ProviderId)) continue;
+    if (seen.has(id)) continue;
     const match = available.find((p) => p.id === id);
     if (match) {
       fallbackConfigs.push(match);

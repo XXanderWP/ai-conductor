@@ -1,7 +1,10 @@
+import { classifyHttpError, type ConductorErrorCode } from '../errors.js';
+import { retryAfterSeconds } from '../ratelimit.js';
 import type { ChatOptions, GenerationParams, Message, TokenUsage, ToolCall } from '../types.js';
 import { isToolCallMessage } from '../utils.js';
 import {
   getFixedTemperature,
+  isLikelyFreeModel,
   isLikelyVisionModel,
   PROVIDERS,
   resolveBaseUrl,
@@ -16,6 +19,8 @@ export interface OpenAIChatSuccess {
   /** Normalized tool calls, present only when the model requested tools. */
   toolCalls?: ToolCall[];
   finishReason?: string;
+  /** Reasoning text (`reasoning_content` / `reasoning` / `reasoning_details`), when sent. */
+  reasoning?: string;
   headers: Record<string, string>;
   status: number;
   raw?: unknown;
@@ -24,21 +29,35 @@ export interface OpenAIChatSuccess {
 export interface OpenAIChatError {
   status: number;
   message: string;
+  code: ConductorErrorCode;
   retryAfterSec?: number;
   headers: Record<string, string>;
+  /** Parsed provider error body. */
+  body?: unknown;
   rateLimited: boolean;
   retryable: boolean;
+  /** Text streamed before the failure. */
+  partialContent?: string;
 }
 
 export type OpenAIChatResult =
   { ok: true; data: OpenAIChatSuccess } | { ok: false; error: OpenAIChatError };
 
 export interface ResolvedProviderEndpoint {
+  /** Provider type. */
   id: ProviderId;
+  /** Instance id (defaults to the provider type). */
+  instanceId?: string;
   model: string;
   apiKey: string;
   baseUrl: string;
   params?: GenerationParams;
+  /** Extra request headers from config. */
+  headers?: Record<string, string>;
+  /** Overrides the registry `supportsReasoningEffort`. */
+  supportsReasoningEffort?: boolean;
+  /** Overrides the registry `supportsStreamUsage`. */
+  supportsStreamUsage?: boolean;
 }
 
 function flattenHeaders(headers: Headers): Record<string, string> {
@@ -49,16 +68,10 @@ function flattenHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
-function parseRetryAfterSeconds(headers: Record<string, string>): number | undefined {
-  const raw = headers['retry-after'];
-  if (!raw) return undefined;
-  const asNum = Number(raw);
-  if (Number.isFinite(asNum) && asNum >= 0) return asNum;
-  const dateMs = Date.parse(raw);
-  if (!Number.isNaN(dateMs)) {
-    return Math.max(0, Math.ceil((dateMs - Date.now()) / 1000));
-  }
-  return undefined;
+function lowerCaseKeys(headers: Record<string, string> | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
+  return out;
 }
 
 function mergeParams(
@@ -74,6 +87,60 @@ function mergeParams(
     frequencyPenalty: options?.frequencyPenalty ?? profileParams?.frequencyPenalty,
     presencePenalty: options?.presencePenalty ?? profileParams?.presencePenalty,
     stop: options?.stop ?? profileParams?.stop,
+  };
+}
+
+/**
+ * Whether the endpoint needs an API key. Custom `openai_compatible` gateways
+ * (non-default `baseUrl`) may be anonymous.
+ */
+export function endpointRequiresApiKey(
+  endpoint: Pick<ResolvedProviderEndpoint, 'id' | 'baseUrl'>,
+): boolean {
+  if (!PROVIDERS[endpoint.id].requiresApiKey) return false;
+  if (endpoint.id === 'openai_compatible') {
+    return resolveBaseUrl(endpoint.id, endpoint.baseUrl) === resolveBaseUrl(endpoint.id);
+  }
+  return true;
+}
+
+/**
+ * Request headers: built-in defaults < config `headers` < request `headers` (keys lower-cased).
+ * No `Authorization` header is sent without a key.
+ */
+function buildHeaders(
+  endpoint: ResolvedProviderEndpoint,
+  extra: Record<string, string> | undefined,
+  json: boolean,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (json) headers['content-type'] = 'application/json';
+  const token = endpoint.apiKey || (endpoint.id === 'ollama' ? 'ollama' : '');
+  if (token) headers.authorization = `Bearer ${token}`;
+
+  if (endpoint.id === 'openrouter') {
+    headers['http-referer'] = 'https://github.com/XXanderWP/ai-conductor';
+    headers['x-title'] = 'AI Conductor';
+  }
+
+  return { ...headers, ...lowerCaseKeys(endpoint.headers), ...lowerCaseKeys(extra) };
+}
+
+function failure(
+  code: ConductorErrorCode,
+  status: number,
+  message: string,
+  headers: Record<string, string> = {},
+  extra: Partial<OpenAIChatError> = {},
+): OpenAIChatError {
+  return {
+    status,
+    message,
+    code,
+    headers,
+    rateLimited: code === 'rate_limited',
+    retryable: code === 'network' || code === 'timeout' || code === 'stalled',
+    ...extra,
   };
 }
 
@@ -95,6 +162,7 @@ function prepareChatRequest(
   stream: boolean,
 ): PreparedChatRequest {
   const meta = PROVIDERS[endpoint.id];
+  const label = endpoint.instanceId ?? endpoint.id;
   const baseUrl = resolveBaseUrl(endpoint.id, endpoint.baseUrl);
   const url = `${baseUrl}/chat/completions`;
   const params = mergeParams(endpoint.id, endpoint.params, options);
@@ -103,26 +171,14 @@ function prepareChatRequest(
   if (!model) {
     return {
       ok: false,
-      error: {
-        status: 400,
-        message: `No model configured for provider "${endpoint.id}".`,
-        headers: {},
-        rateLimited: false,
-        retryable: false,
-      },
+      error: failure('config', 400, `No model configured for provider "${label}".`),
     };
   }
 
-  if (meta.requiresApiKey && !endpoint.apiKey) {
+  if (endpointRequiresApiKey(endpoint) && !endpoint.apiKey) {
     return {
       ok: false,
-      error: {
-        status: 401,
-        message: `API key required for provider "${endpoint.id}".`,
-        headers: {},
-        rateLimited: false,
-        retryable: false,
-      },
+      error: failure('config', 401, `API key required for provider "${label}".`),
     };
   }
 
@@ -150,22 +206,26 @@ function prepareChatRequest(
       body.parallel_tool_calls = options.parallelToolCalls;
     }
   }
-
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    authorization: `Bearer ${endpoint.apiKey || (endpoint.id === 'ollama' ? 'ollama' : '')}`,
-  };
-
-  if (endpoint.id === 'openrouter') {
-    headers['http-referer'] = 'https://github.com/XXanderWP/ai-conductor';
-    headers['x-title'] = 'AI Conductor';
+  if (
+    options?.reasoningEffort !== undefined &&
+    (endpoint.supportsReasoningEffort ?? meta.supportsReasoningEffort === true)
+  ) {
+    body.reasoning_effort = options.reasoningEffort;
   }
+  if (
+    stream &&
+    body.stream_options === undefined &&
+    (endpoint.supportsStreamUsage ?? meta.supportsStreamUsage === true)
+  ) {
+    body.stream_options = { include_usage: true };
+  }
+  if (options?.extraBody) Object.assign(body, options.extraBody);
 
   return {
     ok: true,
     url,
     model,
-    headers,
+    headers: buildHeaders(endpoint, options?.headers, true),
     body,
     timeoutMs: options?.timeoutMs ?? 120_000,
   };
@@ -186,6 +246,7 @@ function errorMessageFromPayload(json: unknown, fallback: string): string {
   ) {
     return (errObj.error as { message: string }).message;
   }
+  if (typeof errObj.error === 'string') return errObj.error;
   if (typeof errObj.message === 'string') return errObj.message;
   return fallback;
 }
@@ -194,43 +255,157 @@ function toHttpError(
   status: number,
   message: string,
   headers: Record<string, string>,
+  body?: unknown,
 ): OpenAIChatError {
-  const rateLimited = status === 429 || /rate.?limit|resource.?exhausted/i.test(message);
+  const code = classifyHttpError(status, message);
   return {
     status,
     message,
-    retryAfterSec: parseRetryAfterSeconds(headers),
+    code,
+    retryAfterSec: retryAfterSeconds(headers, body, message),
     headers,
-    rateLimited,
-    retryable: rateLimited || status >= 500,
+    ...(body !== undefined ? { body } : {}),
+    rateLimited: code === 'rate_limited',
+    retryable: code === 'rate_limited' || status >= 500,
   };
 }
 
-function abortErrorMessage(
-  error: unknown,
-  timeoutMs: number,
-  externalSignal?: AbortSignal,
-): string {
-  if (externalSignal?.aborted) return 'Request cancelled';
-  if (error instanceof Error && error.name === 'AbortError') {
-    return `Request timed out after ${timeoutMs}ms`;
+async function readErrorResponse(
+  response: Response,
+  headers: Record<string, string>,
+): Promise<OpenAIChatError> {
+  const text = await response.text();
+  let json: unknown;
+  try {
+    json = text ? JSON.parse(text) : undefined;
+  } catch {
+    json = undefined;
   }
-  if (error instanceof Error) return error.message;
-  return String(error);
+  return toHttpError(
+    response.status,
+    errorMessageFromPayload(json, text || response.statusText || `HTTP ${response.status}`),
+    headers,
+    json ?? (text || undefined),
+  );
 }
 
-function attachAbortBridge(
-  externalSignal: AbortSignal | undefined,
-  controller: AbortController,
-): () => void {
-  if (!externalSignal) return () => undefined;
-  if (externalSignal.aborted) {
-    controller.abort();
-    return () => undefined;
+type AbortKind = 'aborted' | 'timeout' | 'stalled';
+
+/** One internal AbortController per request with the reason of the first abort. */
+class RequestAbort {
+  readonly controller = new AbortController();
+  kind?: AbortKind;
+  message?: string;
+
+  abort(kind: AbortKind, message: string): void {
+    if (this.kind) return;
+    this.kind = kind;
+    this.message = message;
+    this.controller.abort();
   }
-  const onAbort = () => controller.abort();
-  externalSignal.addEventListener('abort', onAbort, { once: true });
-  return () => externalSignal.removeEventListener('abort', onAbort);
+
+  /** Link an external signal; returns a detach function that removes the listener. */
+  link(external: AbortSignal | undefined): () => void {
+    if (!external) return () => undefined;
+    const onAbort = () => this.abort('aborted', 'Request cancelled');
+    if (external.aborted) {
+      onAbort();
+      return () => undefined;
+    }
+    external.addEventListener('abort', onAbort, { once: true });
+    return () => external.removeEventListener('abort', onAbort);
+  }
+
+  toError(error: unknown, partialContent?: string): OpenAIChatError {
+    const extra = partialContent ? { partialContent } : {};
+    if (this.kind) {
+      return failure(this.kind, 0, this.message ?? 'Request cancelled', {}, extra);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return failure('network', 0, message, {}, extra);
+  }
+}
+
+/**
+ * Call an OpenAI-compatible `/chat/completions` endpoint via fetch.
+ * `externalSignal` (or `options.signal`) cancels the request.
+ */
+export async function openaiChatCompletion(
+  endpoint: ResolvedProviderEndpoint,
+  messages: Message[],
+  options?: ChatOptions,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  externalSignal?: AbortSignal,
+): Promise<OpenAIChatResult> {
+  const prepared = prepareChatRequest(endpoint, messages, options, false);
+  if (!prepared.ok) return prepared;
+
+  const { url, model, headers, body, timeoutMs } = prepared;
+  const abort = new RequestAbort();
+  const detach = abort.link(externalSignal ?? options?.signal);
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(
+          () => abort.abort('timeout', `Request timed out after ${timeoutMs}ms`),
+          timeoutMs,
+        )
+      : undefined;
+
+  try {
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: abort.controller.signal,
+    });
+
+    const responseHeaders = flattenHeaders(response.headers);
+    if (!response.ok) {
+      return { ok: false, error: await readErrorResponse(response, responseHeaders) };
+    }
+
+    const text = await response.text();
+    let json: unknown;
+    try {
+      json = text ? JSON.parse(text) : undefined;
+    } catch {
+      json = undefined;
+    }
+
+    const parsed = parseCompletionPayload(json);
+    if (typeof parsed.content !== 'string' && !parsed.toolCalls) {
+      return {
+        ok: false,
+        error: failure(
+          'http',
+          response.status,
+          'Provider returned no message content.',
+          responseHeaders,
+          { retryable: true, ...(json !== undefined ? { body: json } : {}) },
+        ),
+      };
+    }
+
+    return {
+      ok: true,
+      data: {
+        content: parsed.content ?? '',
+        model: parsed.model ?? model,
+        usage: parsed.usage,
+        ...(parsed.toolCalls ? { toolCalls: parsed.toolCalls } : {}),
+        ...(parsed.finishReason ? { finishReason: parsed.finishReason } : {}),
+        ...(parsed.reasoning ? { reasoning: parsed.reasoning } : {}),
+        headers: responseHeaders,
+        status: response.status,
+        raw: json,
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: abort.toError(error) };
+  } finally {
+    clearTimeout(timer);
+    detach();
+  }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -290,6 +465,7 @@ interface ParsedCompletion {
   finishReason?: string;
   model?: string;
   usage?: TokenUsage;
+  reasoning?: string;
 }
 
 /** Parse a non-streaming `/chat/completions` JSON body. */
@@ -304,6 +480,7 @@ function parseCompletionPayload(json: unknown): ParsedCompletion {
     finishReason: typeof choiceObj.finish_reason === 'string' ? choiceObj.finish_reason : undefined,
     model: typeof data.model === 'string' ? data.model : undefined,
     usage: parseUsage(data.usage),
+    reasoning: reasoningText(message) || undefined,
   };
 }
 
@@ -398,56 +575,150 @@ class ToolCallAssembler {
   }
 }
 
-interface SseStreamParseResult {
+/** Stream activity kinds reported to {@link OpenAIStreamHooks.onActivity}. */
+export type StreamActivity = 'reasoning' | 'text' | 'tool';
+
+/** Optional stream callbacks and watchdogs. */
+export interface OpenAIStreamHooks {
+  onReasoning?: (text: string) => void;
+  onActivity?: (kind: StreamActivity) => void;
+  /** Abort when no bytes arrive for this long (default 60_000; `0` disables). */
+  idleTimeoutMs?: number;
+  /** Hard limit for the whole stream after headers (default 300_000; `0` disables). */
+  totalTimeoutMs?: number;
+}
+
+/** Reasoning text from a delta or message (`reasoning_content`, `reasoning`, `reasoning_details`). */
+function reasoningText(source: Record<string, unknown>): string {
+  if (typeof source.reasoning_content === 'string') return source.reasoning_content;
+  if (typeof source.reasoning === 'string') return source.reasoning;
+  if (Array.isArray(source.reasoning_details)) {
+    return source.reasoning_details
+      .map((detail) =>
+        isPlainObject(detail)
+          ? typeof detail.text === 'string'
+            ? detail.text
+            : typeof detail.summary === 'string'
+              ? detail.summary
+              : ''
+          : '',
+      )
+      .join('');
+  }
+  return '';
+}
+
+/** Mutable stream state, readable after a failure (partial content). */
+interface SseState {
   content: string;
+  reasoning: string;
   model?: string;
   usage?: TokenUsage;
-  toolCalls?: ToolCall[];
   finishReason?: string;
+  streamError?: { message: string; body: unknown };
   rawChunks: unknown[];
+  toolCalls: ToolCallAssembler;
   /** True once at least one non-empty content delta was delivered to onDelta. */
   emitted: boolean;
-  /** Error object sent inside the stream (`data: {"error": …}`). */
-  streamError?: string;
+}
+
+function newSseState(): SseState {
+  return {
+    content: '',
+    reasoning: '',
+    rawChunks: [],
+    toolCalls: new ToolCallAssembler(),
+    emitted: false,
+  };
+}
+
+/** Apply one parsed SSE `data:` JSON chunk to the state. */
+function applySseChunk(
+  state: SseState,
+  json: unknown,
+  onDelta: (delta: string) => void,
+  hooks: OpenAIStreamHooks | undefined,
+): void {
+  state.rawChunks.push(json);
+  const errorPayload = unwrapErrorPayload(json);
+  if (isPlainObject(errorPayload) && errorPayload.error) {
+    state.streamError = {
+      message: errorMessageFromPayload(errorPayload, 'Provider sent an error in the stream.'),
+      body: json,
+    };
+    return;
+  }
+  if (!isPlainObject(json)) return;
+
+  if (typeof json.model === 'string' && json.model) state.model = json.model;
+
+  const choice = Array.isArray(json.choices) ? (json.choices[0] as unknown) : undefined;
+  if (isPlainObject(choice)) {
+    const delta = isPlainObject(choice.delta) ? choice.delta : {};
+    const reasoning = reasoningText(delta);
+    if (reasoning) {
+      state.reasoning += reasoning;
+      hooks?.onReasoning?.(reasoning);
+      hooks?.onActivity?.('reasoning');
+    }
+    if (typeof delta.content === 'string' && delta.content.length > 0) {
+      state.content += delta.content;
+      state.emitted = true;
+      onDelta(delta.content);
+      hooks?.onActivity?.('text');
+    }
+    if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
+      state.toolCalls.add(delta.tool_calls);
+      hooks?.onActivity?.('tool');
+    }
+    if (typeof choice.finish_reason === 'string') state.finishReason = choice.finish_reason;
+  }
+
+  const groq = isPlainObject(json.x_groq) ? json.x_groq : undefined;
+  const usage = parseUsage(json.usage) ?? parseUsage(groq?.usage);
+  if (usage) state.usage = usage;
 }
 
 /**
  * Read an OpenAI-compatible SSE chat stream and invoke `onDelta` for each content piece.
  * Tool call fragments are assembled separately and never sent to `onDelta`.
  * A provider that ignores `stream: true` and returns plain JSON is parsed as a full completion.
+ * `onBytes` is called for every received chunk (watchdog reset).
  */
 async function readSseChatStream(
   body: ReadableStream<Uint8Array>,
   onDelta: (delta: string) => void,
-  signal?: AbortSignal,
-): Promise<SseStreamParseResult> {
+  signal: AbortSignal,
+  state: SseState,
+  hooks: OpenAIStreamHooks | undefined,
+  onBytes: () => void,
+): Promise<void> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  let content = '';
-  let model: string | undefined;
-  let usage: TokenUsage | undefined;
-  let finishReason: string | undefined;
-  let streamError: string | undefined;
-  const rawChunks: unknown[] = [];
-  const toolCalls = new ToolCallAssembler();
-  let emitted = false;
   let sawData = false;
   let rawText = '';
 
-  const throwIfAborted = () => {
-    if (signal?.aborted) {
+  let detachAbort = () => undefined as void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    const onAbort = () => {
       const err = new Error('Request cancelled');
       err.name = 'AbortError';
-      throw err;
+      reject(err);
+    };
+    if (signal.aborted) onAbort();
+    else {
+      signal.addEventListener('abort', onAbort, { once: true });
+      detachAbort = () => signal.removeEventListener('abort', onAbort);
     }
-  };
+  });
+  aborted.catch(() => undefined);
 
   try {
     while (true) {
-      throwIfAborted();
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), aborted]);
       if (done) break;
+      onBytes();
 
       const decoded = decoder.decode(value, { stream: true });
       if (!sawData) rawText += decoded;
@@ -471,43 +742,13 @@ async function readSseChatStream(
         } catch {
           continue;
         }
-
-        rawChunks.push(json);
-        const errorPayload = unwrapErrorPayload(json);
-        if (isPlainObject(errorPayload) && errorPayload.error) {
-          streamError = errorMessageFromPayload(
-            errorPayload,
-            'Provider sent an error in the stream.',
-          );
-          continue;
-        }
-
-        const obj = json as {
-          model?: string;
-          choices?: Array<{
-            delta?: { content?: string | null; tool_calls?: unknown };
-            finish_reason?: string | null;
-          }>;
-          usage?: unknown;
-        };
-
-        if (typeof obj.model === 'string' && obj.model) model = obj.model;
-
-        const choice = obj.choices?.[0];
-        const delta = choice?.delta?.content;
-        if (typeof delta === 'string' && delta.length > 0) {
-          content += delta;
-          emitted = true;
-          onDelta(delta);
-        }
-        toolCalls.add(choice?.delta?.tool_calls);
-        if (typeof choice?.finish_reason === 'string') finishReason = choice.finish_reason;
-
-        if (obj.usage) usage = parseUsage(obj.usage);
+        applySseChunk(state, json, onDelta, hooks);
       }
     }
   } finally {
-    reader.releaseLock();
+    detachAbort();
+    if (signal.aborted) void reader.cancel().catch(() => undefined);
+    else reader.releaseLock();
   }
 
   if (!sawData) {
@@ -516,127 +757,36 @@ async function readSseChatStream(
     try {
       json = JSON.parse(rawText + decoder.decode());
     } catch {
-      json = undefined;
+      return;
     }
-    if (json !== undefined) {
-      const errorPayload = unwrapErrorPayload(json);
-      if (isPlainObject(errorPayload) && errorPayload.error) {
-        streamError = errorMessageFromPayload(errorPayload, 'Provider returned an error.');
-        return { content, rawChunks: [json], emitted, streamError };
-      }
-      const parsed = parseCompletionPayload(json);
-      if (parsed.content) {
-        emitted = true;
-        onDelta(parsed.content);
-      }
-      return {
-        content: parsed.content ?? '',
-        model: parsed.model,
-        usage: parsed.usage,
-        toolCalls: parsed.toolCalls,
-        finishReason: parsed.finishReason,
-        rawChunks: [json],
-        emitted,
+    state.rawChunks.push(json);
+    const errorPayload = unwrapErrorPayload(json);
+    if (isPlainObject(errorPayload) && errorPayload.error) {
+      state.streamError = {
+        message: errorMessageFromPayload(errorPayload, 'Provider returned an error.'),
+        body: json,
       };
+      return;
     }
-  }
-
-  return {
-    content,
-    model,
-    usage,
-    toolCalls: toolCalls.finish(),
-    finishReason,
-    rawChunks,
-    emitted,
-    streamError,
-  };
-}
-
-/**
- * Call an OpenAI-compatible `/chat/completions` endpoint via fetch.
- */
-export async function openaiChatCompletion(
-  endpoint: ResolvedProviderEndpoint,
-  messages: Message[],
-  options?: ChatOptions,
-  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
-): Promise<OpenAIChatResult> {
-  const prepared = prepareChatRequest(endpoint, messages, options, false);
-  if (!prepared.ok) return prepared;
-
-  const { url, model, headers, body, timeoutMs } = prepared;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetchImpl(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-
-    const responseHeaders = flattenHeaders(response.headers);
-    const text = await response.text();
-    let json: unknown;
-    try {
-      json = text ? JSON.parse(text) : undefined;
-    } catch {
-      json = undefined;
-    }
-
-    if (!response.ok) {
-      return {
-        ok: false,
-        error: toHttpError(
-          response.status,
-          errorMessageFromPayload(json, text || response.statusText),
-          responseHeaders,
-        ),
-      };
-    }
-
     const parsed = parseCompletionPayload(json);
-    if (typeof parsed.content !== 'string' && !parsed.toolCalls) {
-      return {
-        ok: false,
-        error: {
-          status: response.status,
-          message: 'Provider returned no message content.',
-          headers: responseHeaders,
-          rateLimited: false,
-          retryable: true,
-        },
-      };
+    if (parsed.reasoning) {
+      state.reasoning = parsed.reasoning;
+      hooks?.onReasoning?.(parsed.reasoning);
+      hooks?.onActivity?.('reasoning');
     }
-
-    return {
-      ok: true,
-      data: {
-        content: parsed.content ?? '',
-        model: parsed.model ?? model,
-        usage: parsed.usage,
-        ...(parsed.toolCalls ? { toolCalls: parsed.toolCalls } : {}),
-        ...(parsed.finishReason ? { finishReason: parsed.finishReason } : {}),
-        headers: responseHeaders,
-        status: response.status,
-        raw: json,
-      },
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: {
-        status: 0,
-        message: abortErrorMessage(error, timeoutMs),
-        headers: {},
-        rateLimited: false,
-        retryable: true,
-      },
-    };
-  } finally {
-    clearTimeout(timer);
+    if (parsed.content) {
+      state.content = parsed.content;
+      state.emitted = true;
+      onDelta(parsed.content);
+      hooks?.onActivity?.('text');
+    }
+    if (parsed.toolCalls) {
+      state.toolCalls.add(parsed.toolCalls.map((call, index) => ({ ...call, index })));
+      hooks?.onActivity?.('tool');
+    }
+    state.model = parsed.model;
+    state.usage = parsed.usage;
+    state.finishReason = parsed.finishReason;
   }
 }
 
@@ -649,9 +799,15 @@ export type OpenAIChatStreamResult =
   | { ok: true; data: OpenAIChatStreamSuccess }
   | { ok: false; error: OpenAIChatError; emitted: boolean };
 
+const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 300_000;
+
 /**
  * Stream an OpenAI-compatible `/chat/completions` response (SSE).
  * Invokes `onDelta` for each content piece as it arrives.
+ *
+ * `options.timeoutMs` bounds the wait for response headers; `hooks.idleTimeoutMs` /
+ * `hooks.totalTimeoutMs` guard the body (`stalled`).
  */
 export async function openaiChatCompletionStream(
   endpoint: ResolvedProviderEndpoint,
@@ -660,43 +816,52 @@ export async function openaiChatCompletionStream(
   options?: ChatOptions,
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
   externalSignal?: AbortSignal,
+  hooks?: OpenAIStreamHooks,
 ): Promise<OpenAIChatStreamResult> {
   const prepared = prepareChatRequest(endpoint, messages, options, true);
   if (!prepared.ok) return { ...prepared, emitted: false };
 
   const { url, model, headers, body, timeoutMs } = prepared;
-  const controller = new AbortController();
-  const detachExternal = attachAbortBridge(externalSignal, controller);
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let emitted = false;
+  const idleMs = hooks?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+  const totalMs = hooks?.totalTimeoutMs ?? DEFAULT_TOTAL_TIMEOUT_MS;
+  const state = newSseState();
+  const abort = new RequestAbort();
+  const detach = abort.link(externalSignal ?? options?.signal);
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let totalTimer: ReturnType<typeof setTimeout> | undefined;
+  const headerTimer =
+    timeoutMs > 0
+      ? setTimeout(
+          () => abort.abort('timeout', `Request timed out after ${timeoutMs}ms`),
+          timeoutMs,
+        )
+      : undefined;
+
+  const resetIdle = () => {
+    if (idleMs <= 0) return;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(
+      () => abort.abort('stalled', `Stream stalled: no data for ${idleMs}ms`),
+      idleMs,
+    );
+  };
 
   try {
     const response = await fetchImpl(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
-      signal: controller.signal,
+      signal: abort.controller.signal,
     });
+    clearTimeout(headerTimer);
 
     const responseHeaders = flattenHeaders(response.headers);
 
     if (!response.ok) {
-      const text = await response.text();
-      let json: unknown;
-      try {
-        json = text ? JSON.parse(text) : undefined;
-      } catch {
-        json = undefined;
-      }
-
       return {
         ok: false,
         emitted: false,
-        error: toHttpError(
-          response.status,
-          errorMessageFromPayload(json, text || response.statusText),
-          responseHeaders,
-        ),
+        error: await readErrorResponse(response, responseHeaders),
       };
     }
 
@@ -704,73 +869,90 @@ export async function openaiChatCompletionStream(
       return {
         ok: false,
         emitted: false,
-        error: {
-          status: response.status,
-          message: 'Provider returned an empty stream body.',
-          headers: responseHeaders,
-          rateLimited: false,
-          retryable: true,
-        },
+        error: failure(
+          'http',
+          response.status,
+          'Provider returned an empty stream body.',
+          responseHeaders,
+          {
+            retryable: true,
+          },
+        ),
       };
     }
 
-    const parsed = await readSseChatStream(response.body, onDelta, controller.signal);
-    emitted = parsed.emitted;
+    if (totalMs > 0) {
+      totalTimer = setTimeout(
+        () => abort.abort('stalled', `Stream exceeded the total timeout of ${totalMs}ms`),
+        totalMs,
+      );
+    }
+    resetIdle();
+    await readSseChatStream(
+      response.body,
+      onDelta,
+      abort.controller.signal,
+      state,
+      hooks,
+      resetIdle,
+    );
 
-    if (parsed.streamError && !parsed.content && !parsed.toolCalls) {
+    const toolCalls = state.toolCalls.finish();
+    const { emitted } = state;
+
+    if (state.streamError && !state.content && !toolCalls) {
       return {
         ok: false,
         emitted,
-        error: {
-          ...toHttpError(response.status, parsed.streamError, responseHeaders),
-          status: response.status,
-        },
+        error: toHttpError(
+          response.status,
+          state.streamError.message,
+          responseHeaders,
+          state.streamError.body,
+        ),
       };
     }
 
-    if (!parsed.content && !parsed.toolCalls) {
+    if (!state.content && !toolCalls) {
       return {
         ok: false,
         emitted,
-        error: {
-          status: response.status,
-          message: 'Provider returned no message content.',
-          headers: responseHeaders,
-          rateLimited: false,
-          retryable: !emitted,
-        },
+        error: failure(
+          'http',
+          response.status,
+          'Provider returned no message content.',
+          responseHeaders,
+          {
+            retryable: !emitted,
+          },
+        ),
       };
     }
 
     return {
       ok: true,
       data: {
-        content: parsed.content,
-        model: parsed.model ?? model,
-        usage: parsed.usage,
-        ...(parsed.toolCalls ? { toolCalls: parsed.toolCalls } : {}),
-        ...(parsed.finishReason ? { finishReason: parsed.finishReason } : {}),
+        content: state.content,
+        model: state.model ?? model,
+        usage: state.usage,
+        ...(toolCalls ? { toolCalls } : {}),
+        ...(state.finishReason ? { finishReason: state.finishReason } : {}),
+        ...(state.reasoning ? { reasoning: state.reasoning } : {}),
         headers: responseHeaders,
         status: response.status,
-        raw: parsed.rawChunks,
+        raw: state.rawChunks,
         emitted,
       },
     };
   } catch (error) {
-    return {
-      ok: false,
-      emitted,
-      error: {
-        status: 0,
-        message: abortErrorMessage(error, timeoutMs, externalSignal),
-        headers: {},
-        rateLimited: false,
-        retryable: !emitted && !externalSignal?.aborted,
-      },
-    };
+    const err = abort.toError(error, state.content || undefined);
+    err.retryable = err.retryable && !state.emitted;
+    return { ok: false, emitted: state.emitted, error: err };
   } finally {
-    clearTimeout(timer);
-    detachExternal();
+    clearTimeout(headerTimer);
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    detach();
   }
 }
 
@@ -782,6 +964,93 @@ export interface OpenAIModelInfo {
   inputModalities?: string[];
   /** Catalog metadata when available, otherwise {@link isLikelyVisionModel}. */
   supportsVision?: boolean;
+  contextLength?: number;
+  supportsTools?: boolean;
+  isFree?: boolean;
+  raw?: unknown;
+}
+
+/** Options for {@link openaiListModels}. */
+export interface OpenAIListModelsOptions {
+  signal?: AbortSignal;
+  /** Add `isFree` (heuristic fallback) and `raw` to every model. */
+  details?: boolean;
+}
+
+function firstPositiveNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const n = typeof value === 'string' ? Number(value) : value;
+    if (typeof n === 'number' && Number.isFinite(n) && n > 0) return n;
+  }
+  return undefined;
+}
+
+function freeFromPricing(pricing: unknown): boolean | undefined {
+  if (!isPlainObject(pricing)) return undefined;
+  const prices = [pricing.prompt, pricing.completion, pricing.input, pricing.output]
+    .map((v) => (typeof v === 'string' ? Number(v) : v))
+    .filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+  return prices.length ? prices.every((v) => v === 0) : undefined;
+}
+
+function toolsFromCatalog(item: Record<string, unknown>): boolean | undefined {
+  const params = readStringArray(item.supported_parameters);
+  if (params) return params.includes('tools');
+  const caps = item.capabilities;
+  if (Array.isArray(caps)) {
+    const list = readStringArray(caps) ?? [];
+    return list.includes('tools') || list.includes('function_calling');
+  }
+  if (isPlainObject(caps)) {
+    const flag = caps.function_calling ?? caps.tools ?? caps.tool_calling;
+    if (typeof flag === 'boolean') return flag;
+  }
+  return undefined;
+}
+
+/** Optional catalog fields: context window, tool support, pricing, raw entry. */
+function catalogFields(
+  provider: ProviderId,
+  id: string,
+  item: Record<string, unknown>,
+  details: boolean | undefined,
+): Partial<OpenAIModelInfo> {
+  const out: Partial<OpenAIModelInfo> = {};
+  const topProvider = isPlainObject(item.top_provider) ? item.top_provider : {};
+  const contextLength = firstPositiveNumber(
+    item.context_length,
+    item.context_window,
+    item.inputTokenLimit,
+    item.input_token_limit,
+    item.max_context_length,
+    topProvider.context_length,
+  );
+  if (contextLength !== undefined) out.contextLength = contextLength;
+  const supportsTools = toolsFromCatalog(item);
+  if (supportsTools !== undefined) out.supportsTools = supportsTools;
+  const isFree = freeFromPricing(item.pricing);
+  if (isFree !== undefined) out.isFree = isFree;
+  else if (details) out.isFree = isLikelyFreeModel(provider, id);
+  if (details) out.raw = item;
+  return out;
+}
+
+/** Timeout + external signal for catalog requests. */
+function catalogAbort(timeoutMs: number, signal: AbortSignal | undefined) {
+  const abort = new RequestAbort();
+  const detach = abort.link(signal);
+  const timer = setTimeout(
+    () => abort.abort('timeout', `Request timed out after ${timeoutMs}ms`),
+    timeoutMs,
+  );
+  return {
+    signal: abort.controller.signal,
+    message: (error: unknown) => abort.toError(error).message,
+    done: () => {
+      clearTimeout(timer);
+      detach();
+    },
+  };
 }
 
 function readStringArray(value: unknown): string[] | undefined {
@@ -844,7 +1113,11 @@ export function normalizeProviderModelId(provider: ProviderId, model: string): s
   return id;
 }
 
-function parseOpenAIModelsPayload(provider: ProviderId, json: unknown): OpenAIModelInfo[] {
+function parseOpenAIModelsPayload(
+  provider: ProviderId,
+  json: unknown,
+  details?: boolean,
+): OpenAIModelInfo[] {
   const data = json && typeof json === 'object' ? (json as { data?: unknown }).data : undefined;
   const list = Array.isArray(data) ? data : [];
   const models: OpenAIModelInfo[] = [];
@@ -854,16 +1127,15 @@ function parseOpenAIModelsPayload(provider: ProviderId, json: unknown): OpenAIMo
     const rawId = (item as { id?: unknown }).id;
     if (typeof rawId !== 'string' || !rawId.trim()) continue;
     const ownedBy = (item as { owned_by?: unknown }).owned_by;
-    models.push(
-      withVision(
+    const id = normalizeProviderModelId(provider, rawId);
+    models.push({
+      ...withVision(
         provider,
-        {
-          id: normalizeProviderModelId(provider, rawId),
-          ownedBy: typeof ownedBy === 'string' ? ownedBy : undefined,
-        },
+        { id, ownedBy: typeof ownedBy === 'string' ? ownedBy : undefined },
         parseInputModalities(item as Record<string, unknown>),
       ),
-    );
+      ...catalogFields(provider, id, item as Record<string, unknown>, details),
+    });
   }
 
   return models;
@@ -872,13 +1144,13 @@ function parseOpenAIModelsPayload(provider: ProviderId, json: unknown): OpenAIMo
 async function listPuterModels(
   timeoutMs: number,
   fetchImpl: typeof globalThis.fetch,
+  options?: OpenAIListModelsOptions,
 ): Promise<OpenAIListModelsResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abort = catalogAbort(timeoutMs, options?.signal);
   try {
     const response = await fetchImpl(PUTER_MODELS_DETAILS_URL, {
       method: 'GET',
-      signal: controller.signal,
+      signal: abort.signal,
     });
     const text = await response.text();
     let json: unknown;
@@ -912,26 +1184,21 @@ async function listPuterModels(
       if (seen.has(id)) continue;
       seen.add(id);
       const provider = (item as { provider?: unknown }).provider;
-      models.push(
-        withVision(
+      models.push({
+        ...withVision(
           'puter',
           { id, ownedBy: typeof provider === 'string' ? provider : 'puter' },
           parseInputModalities(item as Record<string, unknown>),
         ),
-      );
+        ...catalogFields('puter', id, item as Record<string, unknown>, options?.details),
+      });
     }
 
     return { ok: true, models };
   } catch (error) {
-    const message =
-      error instanceof Error
-        ? error.name === 'AbortError'
-          ? `Request timed out after ${timeoutMs}ms`
-          : error.message
-        : String(error);
-    return { ok: false, status: 0, error: message };
+    return { ok: false, status: 0, error: abort.message(error) };
   } finally {
-    clearTimeout(timer);
+    abort.done();
   }
 }
 
@@ -939,14 +1206,14 @@ async function listOllamaNativeTags(
   baseUrl: string,
   timeoutMs: number,
   fetchImpl: typeof globalThis.fetch,
+  options?: OpenAIListModelsOptions,
 ): Promise<OpenAIListModelsResult> {
   const nativeBase = baseUrl.replace(/\/v1\/?$/, '');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abort = catalogAbort(timeoutMs, options?.signal);
   try {
     const response = await fetchImpl(`${nativeBase}/api/tags`, {
       method: 'GET',
-      signal: controller.signal,
+      signal: abort.signal,
     });
     const text = await response.text();
     let json: unknown;
@@ -972,21 +1239,19 @@ async function listOllamaNativeTags(
         const name =
           item && typeof item === 'object' ? (item as { name?: unknown }).name : undefined;
         if (typeof name === 'string' && name.trim()) {
-          models.push(withVision('ollama', { id: name.trim(), ownedBy: 'ollama' }));
+          const id = name.trim();
+          models.push({
+            ...withVision('ollama', { id, ownedBy: 'ollama' }),
+            ...(options?.details ? { isFree: true, raw: item } : {}),
+          });
         }
       }
     }
     return { ok: true, models };
   } catch (error) {
-    const message =
-      error instanceof Error
-        ? error.name === 'AbortError'
-          ? `Request timed out after ${timeoutMs}ms`
-          : error.message
-        : String(error);
-    return { ok: false, status: 0, error: message };
+    return { ok: false, status: 0, error: abort.message(error) };
   } finally {
-    clearTimeout(timer);
+    abort.done();
   }
 }
 
@@ -998,40 +1263,30 @@ export async function openaiListModels(
   endpoint: ResolvedProviderEndpoint,
   timeoutMs = 15_000,
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  options?: OpenAIListModelsOptions,
 ): Promise<OpenAIListModelsResult> {
-  const meta = PROVIDERS[endpoint.id];
-
-  if (meta.requiresApiKey && !endpoint.apiKey) {
+  if (endpointRequiresApiKey(endpoint) && !endpoint.apiKey) {
     return {
       ok: false,
       status: 401,
-      error: `API key required for provider "${endpoint.id}".`,
+      error: `API key required for provider "${endpoint.instanceId ?? endpoint.id}".`,
     };
   }
 
   if (endpoint.id === 'puter') {
-    return listPuterModels(timeoutMs, fetchImpl);
+    return listPuterModels(timeoutMs, fetchImpl, options);
   }
 
   const baseUrl = resolveBaseUrl(endpoint.id, endpoint.baseUrl);
   const url = `${baseUrl}/models`;
-  const headers: Record<string, string> = {
-    authorization: `Bearer ${endpoint.apiKey || (endpoint.id === 'ollama' ? 'ollama' : '')}`,
-  };
-
-  if (endpoint.id === 'openrouter') {
-    headers['http-referer'] = 'https://github.com/XXanderWP/ai-conductor';
-    headers['x-title'] = 'AI Conductor';
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const headers = buildHeaders(endpoint, undefined, false);
+  const abort = catalogAbort(timeoutMs, options?.signal);
 
   try {
     const response = await fetchImpl(url, {
       method: 'GET',
       headers,
-      signal: controller.signal,
+      signal: abort.signal,
     });
 
     const text = await response.text();
@@ -1044,7 +1299,7 @@ export async function openaiListModels(
 
     if (!response.ok) {
       if (endpoint.id === 'ollama') {
-        const fallback = await listOllamaNativeTags(baseUrl, timeoutMs, fetchImpl);
+        const fallback = await listOllamaNativeTags(baseUrl, timeoutMs, fetchImpl, options);
         if (fallback.ok) return fallback;
       }
 
@@ -1064,21 +1319,47 @@ export async function openaiListModels(
       return { ok: false, status: response.status, error: String(errMsg) };
     }
 
-    return { ok: true, models: parseOpenAIModelsPayload(endpoint.id, json) };
+    return { ok: true, models: parseOpenAIModelsPayload(endpoint.id, json, options?.details) };
   } catch (error) {
-    if (endpoint.id === 'ollama') {
-      const fallback = await listOllamaNativeTags(baseUrl, timeoutMs, fetchImpl);
+    const message = abort.message(error);
+    if (endpoint.id === 'ollama' && !options?.signal?.aborted) {
+      const fallback = await listOllamaNativeTags(baseUrl, timeoutMs, fetchImpl, options);
       if (fallback.ok) return fallback;
     }
-
-    const message =
-      error instanceof Error
-        ? error.name === 'AbortError'
-          ? `Request timed out after ${timeoutMs}ms`
-          : error.message
-        : String(error);
     return { ok: false, status: 0, error: message };
   } finally {
-    clearTimeout(timer);
+    abort.done();
   }
+}
+
+/** Result of {@link detectOllama}. */
+export interface DetectOllamaResult {
+  ok: boolean;
+  /** OpenAI-compatible base URL (`…/v1`). */
+  baseUrl: string;
+  models?: OpenAIModelInfo[];
+  error?: string;
+}
+
+/**
+ * Check whether an Ollama server answers at `baseUrl` (default `http://127.0.0.1:11434`)
+ * via its native `/api/tags`, and list the installed models.
+ */
+export async function detectOllama(
+  baseUrl?: string,
+  options?: { timeoutMs?: number; signal?: AbortSignal; fetch?: typeof globalThis.fetch },
+): Promise<DetectOllamaResult> {
+  const native = (baseUrl?.trim() || PROVIDERS.ollama.defaultBaseUrl)
+    .replace(/\/+$/, '')
+    .replace(/\/v1$/, '');
+  const result = await listOllamaNativeTags(
+    native,
+    options?.timeoutMs ?? 2_000,
+    options?.fetch ?? globalThis.fetch,
+    { signal: options?.signal },
+  );
+  const openaiBase = `${native}/v1`;
+  return result.ok
+    ? { ok: true, baseUrl: openaiBase, models: result.models }
+    : { ok: false, baseUrl: openaiBase, error: result.error };
 }

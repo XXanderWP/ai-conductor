@@ -92,10 +92,30 @@ export interface ChatOptions {
   frequencyPenalty?: number;
   presencePenalty?: number;
   stop?: string[];
-  /** Request timeout in milliseconds (default 120_000). */
+  /**
+   * Request timeout in milliseconds (default 120_000). For streams: the wait for response
+   * headers (see {@link ChatStreamOptions.idleTimeoutMs} / `totalTimeoutMs` for the body).
+   */
   timeoutMs?: number;
-  /** Extra OpenAI-compatible body fields. */
+  /** Extra OpenAI-compatible body fields (spread right after `model` / `messages` / `stream`). */
   metadata?: Record<string, unknown>;
+  /** Extra body fields merged into the request body **last** (override everything). */
+  extraBody?: Record<string, unknown>;
+  /** Extra request headers (override config `headers` and built-in defaults). */
+  headers?: Record<string, string>;
+  /** Cancel the request. Rejects with `ConductorError` `code: 'aborted'` and stops failover. */
+  signal?: AbortSignal;
+  /**
+   * `false`: no routing strategy and no fallback list. With `provider`, call exactly that
+   * instance; without it, only the first routed one. Default `true`.
+   */
+  fallback?: boolean;
+  /** Extra attempts on the same provider for retryable errors (default `0`). */
+  retries?: number;
+  /** OpenAI `reasoning_effort`; sent only to providers with `supportsReasoningEffort`. */
+  reasoningEffort?: ReasoningEffort;
+  /** Remove `<think>…</think>` blocks from `content` and streamed text. Default `false`. */
+  stripThinking?: boolean;
   /** Tools the model may call (OpenAI `tools`). Providers with `supportsTools: false` are skipped. */
   tools?: ToolDefinition[];
   /** OpenAI `tool_choice`; sent only when `tools` is non-empty. */
@@ -109,6 +129,9 @@ export interface ChatOptions {
   allowToolFailover?: boolean;
 }
 
+/** OpenAI-compatible `reasoning_effort` values. */
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high';
+
 /** Token usage when reported by the provider. */
 export interface TokenUsage {
   promptTokens?: number;
@@ -119,7 +142,10 @@ export interface TokenUsage {
 /** Successful chat response from {@link Conductor.chat}. */
 export interface ChatResponse {
   content: string;
+  /** Provider instance id (equals the provider type for single-instance configs). */
   provider: ProviderId | string;
+  /** Provider type of {@link provider}. */
+  providerType?: ProviderId;
   model?: string;
   usage?: TokenUsage;
   /** Routing strategy that selected the provider. */
@@ -132,6 +158,10 @@ export interface ChatResponse {
   toolCalls?: ToolCall[];
   /** Provider `finish_reason` (`stop`, `tool_calls`, `length`, …). */
   finishReason?: string;
+  /** Lower-cased response headers of the successful call (`x-ratelimit-*`, gateway headers). */
+  headers?: Record<string, string>;
+  /** Reasoning text collected from the provider (or stripped `<think>` blocks). */
+  reasoning?: string;
 }
 
 /**
@@ -147,6 +177,14 @@ export interface ChatStreamOptions extends ChatOptions {
   chunkMode?: StreamChunkMode;
   /** Called once per finished tool call when the stream ends (tool fragments never reach `onChunk`). */
   onToolCall?: (call: ToolCall) => void;
+  /** Abort when no bytes arrive for this long (default 60_000; `0` disables). Rejects with `stalled`. */
+  idleTimeoutMs?: number;
+  /** Hard limit for the whole stream (default 300_000; `0` disables). Rejects with `stalled`. */
+  totalTimeoutMs?: number;
+  /** Reasoning deltas (`reasoning` / `reasoning_content` / `reasoning_details`, stripped `<think>`). */
+  onReasoning?: (text: string) => void;
+  /** Called for every chunk of that kind (e.g. for a "model is thinking…" indicator). */
+  onActivity?: (kind: 'reasoning' | 'text' | 'tool') => void;
 }
 
 /** Handle returned by {@link Conductor.chatStream}. */
@@ -185,6 +223,22 @@ export interface ModelInfo {
    * reports it, otherwise from {@link isLikelyVisionModel}.
    */
   supportsVision?: boolean;
+  /** Context window in tokens (`context_length` / `context_window` / `inputTokenLimit`). */
+  contextLength?: number;
+  /** Tool support from `supported_parameters` / capability fields, when reported. */
+  supportsTools?: boolean;
+  /** From catalog pricing when present; with `details: true`, falls back to `isLikelyFreeModel`. */
+  isFree?: boolean;
+  /** Raw catalog entry (only with `details: true`). */
+  raw?: unknown;
+}
+
+/** Options for {@link Conductor.listModels}. */
+export interface ListModelsOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /** Add `isFree` (heuristic fallback) and `raw` to every model. Default `false`. */
+  details?: boolean;
 }
 
 /** Result of listing models for one provider. */
@@ -206,6 +260,7 @@ export interface ProviderTestOptions {
   prompt?: string;
   /** Per-request timeout in milliseconds. */
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 /** Result of a provider connectivity or real chat probe. */

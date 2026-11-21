@@ -42,7 +42,7 @@ All code, documentation, comments, commit messages in this repository, and skill
 
 ## Auto-synced project facts
 
-- Package: `@xxanderwp/ai-conductor@0.2.0`
+- Package: `@xxanderwp/ai-conductor@0.3.0`
 - Author: XXanderWP
 - License: MIT
 - Entry: `src/index.ts` → `dist/`
@@ -66,13 +66,15 @@ All code, documentation, comments, commit messages in this repository, and skill
 
 ## Public API notes
 
-- Construct with `configPath` and/or inline `providers` / `routing` / `fallback` / `apiKeys`.
+- Construct with `configPath` and/or inline `providers` / `routing` / `fallback` / `apiKeys`; `env: false` for embedded hosts; `onResponse`, `usageStore`; `updateConfig(partial)` at runtime.
+- Instances: `{ id, provider }` lets several entries share one provider type; ids, usage, `fallback` and `apiKeys` are per instance.
+- Transport: `fallback: false`, `retries`, `signal`, `headers`, `extraBody`, `reasoningEffort`; failures reject with `ConductorError` (`code`, `status`, `retryAfterSec`, `attempts`, …).
 - Provider registry lives in `src/providers/registry.ts`.
 - Strategies: `cheapest`, `priority`, `failover`, `round-robin`, `first-available`.
 - Discovery / probes: `getAvailableProviders`, `getConfiguredProviders`, `listModels`, `testProvider` / `testProviders` (`real?: boolean`).
 - Context: `compressContext(messages, { keepLast? })` folds earlier turns into a system summary.
 - Vision: `recognizeImage(image | images, options?)`; discovery via `getVisionCapabilities`, `supportsVision(id, model?)`, `listVisionModels`. `Message.content` accepts OpenAI `text` / `image_url` parts.
-- Streaming: `chatStream(input, onChunk, options?)` → `{ result, cancel }`; `chunkMode: 'delta' | 'cumulative'`.
+- Streaming: `chatStream(input, onChunk, options?)` → `{ result, cancel }`; `chunkMode: 'delta' | 'cumulative'`; watchdogs `idleTimeoutMs` / `totalTimeoutMs`; `onReasoning`, `onActivity`, `stripThinking`.
 - Tool calling: `tools` / `toolChoice` / `parallelToolCalls` options, `res.toolCalls` / `res.finishReason`, stream `onToolCall`; helpers `assistantMessageFromResponse`, `toolResultMessage`. Keep `extra_content`; tool history is pinned to one provider unless `allowToolFailover`.
 
 <!-- GENERATED:START -->

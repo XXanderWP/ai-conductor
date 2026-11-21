@@ -14,6 +14,13 @@ Guide agents implementing or extending the AI Conductor public API and provider 
 - `conductor.recognizeImage(image | images, { prompt?, systemPrompt?, detail?, ...ChatOptions })` — vision request; routes only through providers with `supportsVision`, model = `options.model` → configured model if vision-capable → `visionModels[0]`. Images: URL, `data:` URL, local path, or `{ data, mimeType }` (`src/vision.ts`)
 - `Message.content` is `string | MessageContentPart[]` (OpenAI `text` / `image_url` parts) — `chat` / `chatStream` accept images too; use `messageText()` to flatten
 - `conductor.getVisionCapabilities({ configuredOnly? })` / `conductor.supportsVision(id, model?)` / `conductor.listVisionModels(id?)` — vision discovery; registry fields `supportsVision` / `visionModels`, heuristic `isLikelyVisionModel` in `src/providers/registry.ts`; `ModelInfo.supportsVision` / `inputModalities` from catalogs
+- Embedding / transport (`src/conductor.ts`, `src/errors.ts`, `src/ratelimit.ts`, `src/think.ts`):
+  - Instances: `{ id: 'gemini-work', provider: 'gemini' }` (`ProviderInstanceConfig`); everything keyed by instance id; `ChatResponse.providerType`
+  - `ChatOptions.fallback: false` (one instance, once), `retries`, `signal`, `headers`, `extraBody` (merged last), `reasoningEffort` (registry `supportsReasoningEffort`), `stripThinking`
+  - Stream: `idleTimeoutMs` / `totalTimeoutMs` (→ `stalled`), `onReasoning`, `onActivity`; usage via `stream_options` (registry `supportsStreamUsage`)
+  - Errors: `ConductorError` (`code`, `status`, `provider`, `retryAfterSec`, `headers`, `body`, `partialContent`, `attempts`), `isConductorError`, `classifyHttpError`
+  - Init: `env: false | true | map`, `onResponse(event)`, `usageStore`; `conductor.updateConfig(partial)`
+  - `ChatResponse.headers` / `reasoning`; `parseRateLimitHeaders`, `detectOllama`, `listModels(id, { details, signal })` → `contextLength` / `supportsTools` / `isFree` / `raw`
 - `conductor.getAvailableProviders()` — built-in registry metadata
 - `conductor.getConfiguredProviders()` — providers from the loaded config
 - `conductor.listModels(providerId | options?)` — parse OpenAI-compatible `GET /models` (Puter / Ollama fallbacks)
@@ -32,6 +39,8 @@ No image input: `cerebras`. All other built-ins accept images for some models; `
 ## Tool support
 
 All built-ins default to `supportsTools: true` (OpenAI-compatible). When adding a provider known to reject `tools`, set `supportsTools: false`; if it rejects `content: null` on assistant tool-call messages, set `assistantNullContent: ''`.
+
+Stream usage (`supportsStreamUsage`): `ollama`, `gemini`, `groq`, `openrouter`, `openai`. `reasoning_effort` (`supportsReasoningEffort`): `gemini`, `groq`, `openai`. Both are overridable per config entry.
 
 ## Routing strategies
 

@@ -59,6 +59,10 @@ export interface ProviderMeta {
    * set `''` for providers that reject `null`.
    */
   assistantNullContent?: '' | null;
+  /** Whether the provider accepts OpenAI `reasoning_effort`. Default `false` (dropped). */
+  supportsReasoningEffort?: boolean;
+  /** Whether streaming accepts `stream_options: { include_usage: true }`. Default `false`. */
+  supportsStreamUsage?: boolean;
 }
 
 /**
@@ -68,6 +72,7 @@ export interface ProviderMeta {
 export const PROVIDERS: Record<ProviderId, ProviderMeta> = {
   ollama: {
     id: 'ollama',
+    supportsStreamUsage: true,
     label: 'Ollama (local)',
     defaultBaseUrl: 'http://127.0.0.1:11434/v1',
     requiresApiKey: false,
@@ -83,6 +88,8 @@ export const PROVIDERS: Record<ProviderId, ProviderMeta> = {
   },
   gemini: {
     id: 'gemini',
+    supportsReasoningEffort: true,
+    supportsStreamUsage: true,
     label: 'Google Gemini',
     defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
     requiresApiKey: true,
@@ -105,6 +112,8 @@ export const PROVIDERS: Record<ProviderId, ProviderMeta> = {
   },
   groq: {
     id: 'groq',
+    supportsReasoningEffort: true,
+    supportsStreamUsage: true,
     label: 'Groq',
     defaultBaseUrl: 'https://api.groq.com/openai/v1',
     requiresApiKey: true,
@@ -299,6 +308,7 @@ export const PROVIDERS: Record<ProviderId, ProviderMeta> = {
   },
   openrouter: {
     id: 'openrouter',
+    supportsStreamUsage: true,
     label: 'OpenRouter',
     defaultBaseUrl: 'https://openrouter.ai/api/v1',
     requiresApiKey: true,
@@ -334,6 +344,8 @@ export const PROVIDERS: Record<ProviderId, ProviderMeta> = {
   },
   openai: {
     id: 'openai',
+    supportsReasoningEffort: true,
+    supportsStreamUsage: true,
     label: 'OpenAI',
     defaultBaseUrl: 'https://api.openai.com/v1',
     requiresApiKey: true,
