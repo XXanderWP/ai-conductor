@@ -1,4 +1,5 @@
-import type { ChatOptions, GenerationParams, Message, TokenUsage } from '../types.js';
+import type { ChatOptions, GenerationParams, Message, TokenUsage, ToolCall } from '../types.js';
+import { isToolCallMessage } from '../utils.js';
 import {
   getFixedTemperature,
   isLikelyVisionModel,
@@ -8,9 +9,13 @@ import {
 } from './registry.js';
 
 export interface OpenAIChatSuccess {
+  /** Assistant text (`''` when the model returned only tool calls). */
   content: string;
   model?: string;
   usage?: TokenUsage;
+  /** Normalized tool calls, present only when the model requested tools. */
+  toolCalls?: ToolCall[];
+  finishReason?: string;
   headers: Record<string, string>;
   status: number;
   raw?: unknown;
@@ -121,9 +126,14 @@ function prepareChatRequest(
     };
   }
 
+  const assistantNullContent = meta.assistantNullContent ?? null;
   const body: Record<string, unknown> = {
     model,
-    messages,
+    messages: messages.map((message) =>
+      isToolCallMessage(message) && !message.content
+        ? { ...message, content: assistantNullContent }
+        : message,
+    ),
     stream,
     ...options?.metadata,
   };
@@ -133,6 +143,13 @@ function prepareChatRequest(
   if (params.frequencyPenalty !== undefined) body.frequency_penalty = params.frequencyPenalty;
   if (params.presencePenalty !== undefined) body.presence_penalty = params.presencePenalty;
   if (params.stop !== undefined) body.stop = params.stop;
+  if (options?.tools?.length) {
+    body.tools = options.tools;
+    if (options.toolChoice !== undefined) body.tool_choice = options.toolChoice;
+    if (options.parallelToolCalls !== undefined) {
+      body.parallel_tool_calls = options.parallelToolCalls;
+    }
+  }
 
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -154,8 +171,14 @@ function prepareChatRequest(
   };
 }
 
+/** Unwrap array error bodies (Gemini returns `[{ error: { … } }]`). */
+function unwrapErrorPayload(json: unknown): unknown {
+  return Array.isArray(json) ? json[0] : json;
+}
+
 function errorMessageFromPayload(json: unknown, fallback: string): string {
-  const errObj = json && typeof json === 'object' ? (json as Record<string, unknown>) : {};
+  const payload = unwrapErrorPayload(json);
+  const errObj = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
   if (
     errObj.error &&
     typeof errObj.error === 'object' &&
@@ -210,17 +233,188 @@ function attachAbortBridge(
   return () => externalSignal.removeEventListener('abort', onAbort);
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stringifyArguments(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  return JSON.stringify(value);
+}
+
+/**
+ * Normalize one provider tool call: object `arguments` → JSON string, missing `id` → generated.
+ * Unknown keys (e.g. `extra_content`) are kept.
+ */
+function normalizeToolCall(raw: unknown, index: number, stamp: number): ToolCall {
+  const src = isPlainObject(raw) ? raw : {};
+  const fn = isPlainObject(src.function) ? src.function : {};
+  const id = typeof src.id === 'string' && src.id ? src.id : `call_${stamp}_${index}`;
+  return {
+    ...src,
+    id,
+    type: 'function',
+    function: {
+      ...fn,
+      name: typeof fn.name === 'string' ? fn.name : '',
+      arguments: stringifyArguments(fn.arguments),
+    },
+  } as ToolCall;
+}
+
+function normalizeToolCalls(raw: unknown): ToolCall[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const stamp = Date.now();
+  return raw.map((call, i) => normalizeToolCall(call, i, stamp));
+}
+
+function parseUsage(raw: unknown): TokenUsage | undefined {
+  if (!isPlainObject(raw)) return undefined;
+  const usage = raw as {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+  return {
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens,
+  };
+}
+
+interface ParsedCompletion {
+  /** `undefined` when the provider sent no string content. */
+  content?: string;
+  toolCalls?: ToolCall[];
+  finishReason?: string;
+  model?: string;
+  usage?: TokenUsage;
+}
+
+/** Parse a non-streaming `/chat/completions` JSON body. */
+function parseCompletionPayload(json: unknown): ParsedCompletion {
+  const data = isPlainObject(json) ? json : {};
+  const choice = Array.isArray(data.choices) ? (data.choices[0] as unknown) : undefined;
+  const choiceObj = isPlainObject(choice) ? choice : {};
+  const message = isPlainObject(choiceObj.message) ? choiceObj.message : {};
+  return {
+    content: typeof message.content === 'string' ? message.content : undefined,
+    toolCalls: normalizeToolCalls(message.tool_calls),
+    finishReason: typeof choiceObj.finish_reason === 'string' ? choiceObj.finish_reason : undefined,
+    model: typeof data.model === 'string' ? data.model : undefined,
+    usage: parseUsage(data.usage),
+  };
+}
+
+/** Merge `extra_content` one level deep so nested keys (e.g. `google.*`) from chunks combine. */
+function mergeExtraContent(
+  target: Record<string, unknown> | undefined,
+  source: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...target };
+  for (const [key, value] of Object.entries(source)) {
+    const existing = out[key];
+    out[key] = isPlainObject(existing) && isPlainObject(value) ? { ...existing, ...value } : value;
+  }
+  return out;
+}
+
+interface ToolCallAccumulator {
+  index?: number;
+  id?: string;
+  type?: string;
+  name: string;
+  arguments: string;
+  extra_content?: Record<string, unknown>;
+  rest: Record<string, unknown>;
+}
+
+/** Assemble streamed `delta.tool_calls[]` fragments by `index`. */
+class ToolCallAssembler {
+  private readonly calls: ToolCallAccumulator[] = [];
+
+  add(fragments: unknown): void {
+    if (!Array.isArray(fragments)) return;
+    fragments.forEach((raw, position) => {
+      if (!isPlainObject(raw)) return;
+      const acc = this.slotFor(raw, fragments.length > 1 ? position : undefined);
+      const {
+        index: _index,
+        id,
+        type,
+        function: fn,
+        extra_content: extra,
+        ...rest
+      } = raw as Record<string, unknown>;
+      if (acc.id === undefined && typeof id === 'string' && id) acc.id = id;
+      if (acc.type === undefined && typeof type === 'string') acc.type = type;
+      if (isPlainObject(fn)) {
+        if (typeof fn.name === 'string') acc.name += fn.name;
+        if (typeof fn.arguments === 'string') acc.arguments += fn.arguments;
+        else if (fn.arguments !== undefined && fn.arguments !== null) {
+          acc.arguments = JSON.stringify(fn.arguments);
+        }
+      }
+      if (isPlainObject(extra)) acc.extra_content = mergeExtraContent(acc.extra_content, extra);
+      Object.assign(acc.rest, rest);
+    });
+  }
+
+  /**
+   * Find the accumulator for a fragment: by `index`, else by `id`, else (no index / id)
+   * the call at the same array position, or the last one for single-fragment chunks.
+   */
+  private slotFor(raw: Record<string, unknown>, position?: number): ToolCallAccumulator {
+    const index = typeof raw.index === 'number' ? raw.index : undefined;
+    const id = typeof raw.id === 'string' && raw.id ? raw.id : undefined;
+    let acc =
+      index !== undefined
+        ? this.calls.find((c) => c.index === index)
+        : id !== undefined
+          ? this.calls.find((c) => c.id === id)
+          : this.calls[position ?? this.calls.length - 1];
+    if (!acc) {
+      acc = { index, name: '', arguments: '', rest: {} };
+      this.calls.push(acc);
+    }
+    return acc;
+  }
+
+  finish(): ToolCall[] | undefined {
+    if (this.calls.length === 0) return undefined;
+    const ordered = [...this.calls].sort(
+      (a, b) => (a.index ?? Number.MAX_SAFE_INTEGER) - (b.index ?? Number.MAX_SAFE_INTEGER),
+    );
+    return normalizeToolCalls(
+      ordered.map((acc) => ({
+        ...acc.rest,
+        ...(acc.id ? { id: acc.id } : {}),
+        type: acc.type ?? 'function',
+        function: { name: acc.name, arguments: acc.arguments },
+        ...(acc.extra_content ? { extra_content: acc.extra_content } : {}),
+      })),
+    );
+  }
+}
+
 interface SseStreamParseResult {
   content: string;
   model?: string;
   usage?: TokenUsage;
+  toolCalls?: ToolCall[];
+  finishReason?: string;
   rawChunks: unknown[];
   /** True once at least one non-empty content delta was delivered to onDelta. */
   emitted: boolean;
+  /** Error object sent inside the stream (`data: {"error": …}`). */
+  streamError?: string;
 }
 
 /**
  * Read an OpenAI-compatible SSE chat stream and invoke `onDelta` for each content piece.
+ * Tool call fragments are assembled separately and never sent to `onDelta`.
+ * A provider that ignores `stream: true` and returns plain JSON is parsed as a full completion.
  */
 async function readSseChatStream(
   body: ReadableStream<Uint8Array>,
@@ -233,8 +427,13 @@ async function readSseChatStream(
   let content = '';
   let model: string | undefined;
   let usage: TokenUsage | undefined;
+  let finishReason: string | undefined;
+  let streamError: string | undefined;
   const rawChunks: unknown[] = [];
+  const toolCalls = new ToolCallAssembler();
   let emitted = false;
+  let sawData = false;
+  let rawText = '';
 
   const throwIfAborted = () => {
     if (signal?.aborted) {
@@ -250,7 +449,9 @@ async function readSseChatStream(
       const { done, value } = await reader.read();
       if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
+      const decoded = decoder.decode(value, { stream: true });
+      if (!sawData) rawText += decoded;
+      buffer += decoded;
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() ?? '';
 
@@ -258,6 +459,8 @@ async function readSseChatStream(
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith(':')) continue;
         if (!trimmed.startsWith('data:')) continue;
+        sawData = true;
+        rawText = '';
 
         const data = trimmed.slice(5).trim();
         if (!data || data === '[DONE]') continue;
@@ -270,39 +473,84 @@ async function readSseChatStream(
         }
 
         rawChunks.push(json);
+        const errorPayload = unwrapErrorPayload(json);
+        if (isPlainObject(errorPayload) && errorPayload.error) {
+          streamError = errorMessageFromPayload(
+            errorPayload,
+            'Provider sent an error in the stream.',
+          );
+          continue;
+        }
+
         const obj = json as {
           model?: string;
-          choices?: Array<{ delta?: { content?: string | null } }>;
-          usage?: {
-            prompt_tokens?: number;
-            completion_tokens?: number;
-            total_tokens?: number;
-          };
+          choices?: Array<{
+            delta?: { content?: string | null; tool_calls?: unknown };
+            finish_reason?: string | null;
+          }>;
+          usage?: unknown;
         };
 
         if (typeof obj.model === 'string' && obj.model) model = obj.model;
 
-        const delta = obj.choices?.[0]?.delta?.content;
+        const choice = obj.choices?.[0];
+        const delta = choice?.delta?.content;
         if (typeof delta === 'string' && delta.length > 0) {
           content += delta;
           emitted = true;
           onDelta(delta);
         }
+        toolCalls.add(choice?.delta?.tool_calls);
+        if (typeof choice?.finish_reason === 'string') finishReason = choice.finish_reason;
 
-        if (obj.usage) {
-          usage = {
-            promptTokens: obj.usage.prompt_tokens,
-            completionTokens: obj.usage.completion_tokens,
-            totalTokens: obj.usage.total_tokens,
-          };
-        }
+        if (obj.usage) usage = parseUsage(obj.usage);
       }
     }
   } finally {
     reader.releaseLock();
   }
 
-  return { content, model, usage, rawChunks, emitted };
+  if (!sawData) {
+    // Provider ignored `stream: true` and answered with a regular JSON completion.
+    let json: unknown;
+    try {
+      json = JSON.parse(rawText + decoder.decode());
+    } catch {
+      json = undefined;
+    }
+    if (json !== undefined) {
+      const errorPayload = unwrapErrorPayload(json);
+      if (isPlainObject(errorPayload) && errorPayload.error) {
+        streamError = errorMessageFromPayload(errorPayload, 'Provider returned an error.');
+        return { content, rawChunks: [json], emitted, streamError };
+      }
+      const parsed = parseCompletionPayload(json);
+      if (parsed.content) {
+        emitted = true;
+        onDelta(parsed.content);
+      }
+      return {
+        content: parsed.content ?? '',
+        model: parsed.model,
+        usage: parsed.usage,
+        toolCalls: parsed.toolCalls,
+        finishReason: parsed.finishReason,
+        rawChunks: [json],
+        emitted,
+      };
+    }
+  }
+
+  return {
+    content,
+    model,
+    usage,
+    toolCalls: toolCalls.finish(),
+    finishReason,
+    rawChunks,
+    emitted,
+    streamError,
+  };
 }
 
 /**
@@ -349,18 +597,8 @@ export async function openaiChatCompletion(
       };
     }
 
-    const data = json as {
-      choices?: Array<{ message?: { content?: string } }>;
-      model?: string;
-      usage?: {
-        prompt_tokens?: number;
-        completion_tokens?: number;
-        total_tokens?: number;
-      };
-    };
-
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== 'string') {
+    const parsed = parseCompletionPayload(json);
+    if (typeof parsed.content !== 'string' && !parsed.toolCalls) {
       return {
         ok: false,
         error: {
@@ -376,15 +614,11 @@ export async function openaiChatCompletion(
     return {
       ok: true,
       data: {
-        content,
-        model: data.model ?? model,
-        usage: data.usage
-          ? {
-              promptTokens: data.usage.prompt_tokens,
-              completionTokens: data.usage.completion_tokens,
-              totalTokens: data.usage.total_tokens,
-            }
-          : undefined,
+        content: parsed.content ?? '',
+        model: parsed.model ?? model,
+        usage: parsed.usage,
+        ...(parsed.toolCalls ? { toolCalls: parsed.toolCalls } : {}),
+        ...(parsed.finishReason ? { finishReason: parsed.finishReason } : {}),
         headers: responseHeaders,
         status: response.status,
         raw: json,
@@ -483,7 +717,18 @@ export async function openaiChatCompletionStream(
     const parsed = await readSseChatStream(response.body, onDelta, controller.signal);
     emitted = parsed.emitted;
 
-    if (!parsed.content) {
+    if (parsed.streamError && !parsed.content && !parsed.toolCalls) {
+      return {
+        ok: false,
+        emitted,
+        error: {
+          ...toHttpError(response.status, parsed.streamError, responseHeaders),
+          status: response.status,
+        },
+      };
+    }
+
+    if (!parsed.content && !parsed.toolCalls) {
       return {
         ok: false,
         emitted,
@@ -503,6 +748,8 @@ export async function openaiChatCompletionStream(
         content: parsed.content,
         model: parsed.model ?? model,
         usage: parsed.usage,
+        ...(parsed.toolCalls ? { toolCalls: parsed.toolCalls } : {}),
+        ...(parsed.finishReason ? { finishReason: parsed.finishReason } : {}),
         headers: responseHeaders,
         status: response.status,
         raw: parsed.rawChunks,
@@ -801,7 +1048,9 @@ export async function openaiListModels(
         if (fallback.ok) return fallback;
       }
 
-      const errObj = json && typeof json === 'object' ? (json as Record<string, unknown>) : {};
+      const payload = unwrapErrorPayload(json);
+      const errObj =
+        payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
       const errMsg =
         (errObj.error &&
           typeof errObj.error === 'object' &&

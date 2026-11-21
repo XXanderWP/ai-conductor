@@ -64,6 +64,7 @@ function normalizeProvider(raw: unknown, index: number): ProviderConfig {
     enabled: src.enabled === false ? false : true,
     isPaid: src.isPaid === true,
     params: normalizeParams(src.params),
+    supportsTools: typeof src.supportsTools === 'boolean' ? src.supportsTools : undefined,
   };
 }
 

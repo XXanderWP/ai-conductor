@@ -42,7 +42,7 @@ All code, documentation, comments, commit messages in this repository, and skill
 
 ## Auto-synced project facts
 
-- Package: `@xxanderwp/ai-conductor@0.1.5`
+- Package: `@xxanderwp/ai-conductor@0.2.0`
 - Author: XXanderWP
 - License: MIT
 - Entry: `src/index.ts` → `dist/`
@@ -73,6 +73,7 @@ All code, documentation, comments, commit messages in this repository, and skill
 - Context: `compressContext(messages, { keepLast? })` folds earlier turns into a system summary.
 - Vision: `recognizeImage(image | images, options?)`; discovery via `getVisionCapabilities`, `supportsVision(id, model?)`, `listVisionModels`. `Message.content` accepts OpenAI `text` / `image_url` parts.
 - Streaming: `chatStream(input, onChunk, options?)` → `{ result, cancel }`; `chunkMode: 'delta' | 'cumulative'`.
+- Tool calling: `tools` / `toolChoice` / `parallelToolCalls` options, `res.toolCalls` / `res.finishReason`, stream `onToolCall`; helpers `assistantMessageFromResponse`, `toolResultMessage`. Keep `extra_content`; tool history is pinned to one provider unless `allowToolFailover`.
 
 <!-- GENERATED:START -->
 <!-- GENERATED:END -->

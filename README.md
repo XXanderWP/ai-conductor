@@ -139,6 +139,85 @@ const { messages } = await conductor.compressContext(history, {
 // messages[0] is a system note about earlier turns; the rest is the recent tail
 ```
 
+## Tool calling
+
+OpenAI-compatible function calling: pass `tools` (and optionally `toolChoice` / `parallelToolCalls`), run the requested tools yourself, push the results into history and call again. The library only transports calls and results — it never executes tools.
+
+```ts
+import {
+  Conductor,
+  assistantMessageFromResponse,
+  toolResultMessage,
+  type Message,
+  type ToolDefinition,
+} from '@xxanderwp/ai-conductor';
+
+const tools: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: 'Current weather for a city',
+      parameters: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+      },
+    },
+  },
+];
+
+async function runTool(name: string, args: Record<string, unknown>): Promise<object> {
+  if (name === 'get_weather') return { city: args.city, tempC: 21, sky: 'sunny' };
+  return { error: `Unknown tool ${name}` };
+}
+
+const history: Message[] = [{ role: 'user', content: 'What is the weather in Berlin?' }];
+
+for (let step = 0; step < 5; step += 1) {
+  const res = await conductor.chat(history, { tools, toolChoice: 'auto' });
+  history.push(assistantMessageFromResponse(res)); // keeps tool_calls + extra_content
+
+  if (!res.toolCalls?.length) {
+    console.log(res.content); // final answer
+    break;
+  }
+
+  for (const call of res.toolCalls) {
+    const output = await runTool(call.function.name, JSON.parse(call.function.arguments || '{}'));
+    history.push(toolResultMessage(call.id, output)); // objects are JSON.stringify-ed
+  }
+}
+```
+
+Streaming works the same way: text deltas go to `onChunk`, tool call fragments are assembled internally and reported once each via `onToolCall` when the stream ends.
+
+```ts
+const { result } = conductor.chatStream(history, (text) => process.stdout.write(text), {
+  tools,
+  onToolCall: (call) => console.log('\n→', call.function.name, call.function.arguments),
+});
+
+const res = await result; // res.toolCalls, res.finishReason ('tool_calls' | 'stop' | …)
+history.push(assistantMessageFromResponse(res));
+for (const call of res.toolCalls ?? []) {
+  history.push(
+    toolResultMessage(
+      call.id,
+      await runTool(call.function.name, JSON.parse(call.function.arguments || '{}')),
+    ),
+  );
+}
+```
+
+Notes:
+
+- `ChatResponse.content` is always a string (`''` when the model returned only tool calls); `toolCalls` / `finishReason` are set when the provider reports them.
+- **Keep `extra_content` and send it back unchanged.** Some providers attach opaque data to tool calls (Gemini `extra_content.google.thought_signature`) and reject the follow-up request without it. `assistantMessageFromResponse` keeps it for you.
+- **History with tool calls is pinned to one provider.** Tool call ids and signatures belong to the provider that issued them, so requests whose history contains tool calls / results do not fail over to another provider. The Conductor routes them to the provider and model that issued the calls (also exposed as `res.provider` / `res.model`). Pass `options.provider` to choose explicitly, or `allowToolFailover: true` to allow failover anyway.
+- With `tools`, providers whose `supportsTools` is `false` are skipped (registry `PROVIDERS[id].supportsTools`, overridable per config entry with `supportsTools: false` for models without tool support).
+- Helpers: `isToolCallMessage`, `isToolResultMessage`, `toolResultMessage`, `assistantMessageFromResponse`. `compressContext` never splits a tool call from its results.
+
 ## Image recognition (vision)
 
 ```ts
@@ -220,7 +299,7 @@ Commands inside the chat: `/status`, `/clear`, `/provider <id|auto>`, `/test-all
 | Field   | Value                     |
 | ------- | ------------------------- |
 | Name    | `@xxanderwp/ai-conductor` |
-| Version | `0.1.5`                   |
+| Version | `0.2.0`                   |
 | Author  | XXanderWP                 |
 | License | MIT                       |
 | Node    | >=18                      |
@@ -260,6 +339,8 @@ src/vision.ts
 tests/
 tests/conductor.test.ts
 tests/suggest.test.ts
+tests/tools.test.ts
+tests/types-compat.test.ts
 ```
 
 ### Skills for LLM agents

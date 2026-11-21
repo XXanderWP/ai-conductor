@@ -29,11 +29,57 @@ export interface ImageContentPart {
 /** One part of a multimodal message. */
 export type MessageContentPart = TextContentPart | ImageContentPart;
 
-/** A single chat message. Use content parts to send images to vision-capable models. */
-export interface Message {
+/** Plain text / multimodal chat message. Use content parts to send images to vision-capable models. */
+export interface TextMessage {
   role: MessageRole;
   content: string | MessageContentPart[];
 }
+
+/** JSON Schema object describing function parameters. */
+export type JsonSchema = Record<string, unknown>;
+
+/** OpenAI-compatible tool (function) definition sent in `tools`. */
+export interface ToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    parameters?: JsonSchema;
+    strict?: boolean;
+  };
+}
+
+/** OpenAI-compatible `tool_choice`. */
+export type ToolChoice =
+  'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
+
+/** Tool call requested by the model. */
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  /** `arguments` is the raw JSON string as sent by the provider. */
+  function: { name: string; arguments: string };
+  /** Opaque provider data that MUST be echoed back unchanged (e.g. Gemini `google.thought_signature`). */
+  extra_content?: Record<string, unknown>;
+}
+
+/** Assistant turn that requested tool calls. Push it into history before the tool results. */
+export interface AssistantToolCallMessage {
+  role: 'assistant';
+  content: string | null;
+  tool_calls: ToolCall[];
+}
+
+/** Result of one tool call, sent back to the model. */
+export interface ToolResultMessage {
+  role: 'tool';
+  tool_call_id: string;
+  content: string;
+  name?: string;
+}
+
+/** A single chat message. */
+export type Message = TextMessage | AssistantToolCallMessage | ToolResultMessage;
 
 /** Per-request generation overrides. */
 export interface ChatOptions {
@@ -50,6 +96,17 @@ export interface ChatOptions {
   timeoutMs?: number;
   /** Extra OpenAI-compatible body fields. */
   metadata?: Record<string, unknown>;
+  /** Tools the model may call (OpenAI `tools`). Providers with `supportsTools: false` are skipped. */
+  tools?: ToolDefinition[];
+  /** OpenAI `tool_choice`; sent only when `tools` is non-empty. */
+  toolChoice?: ToolChoice;
+  /** OpenAI `parallel_tool_calls`; sent only when defined and `tools` is non-empty. */
+  parallelToolCalls?: boolean;
+  /**
+   * History with tool calls / tool results is pinned to one provider (tool call ids and
+   * `extra_content` belong to the provider that issued them). Set `true` to allow failover anyway.
+   */
+  allowToolFailover?: boolean;
 }
 
 /** Token usage when reported by the provider. */
@@ -71,6 +128,10 @@ export interface ChatResponse {
   failedProviders?: string[];
   /** Raw provider JSON body when available. */
   raw?: unknown;
+  /** Tool calls requested by the model (present only when it requested tools). */
+  toolCalls?: ToolCall[];
+  /** Provider `finish_reason` (`stop`, `tool_calls`, `length`, …). */
+  finishReason?: string;
 }
 
 /**
@@ -84,6 +145,8 @@ export type StreamChunkMode = 'delta' | 'cumulative';
 export interface ChatStreamOptions extends ChatOptions {
   /** Callback payload shape. Default: `delta`. */
   chunkMode?: StreamChunkMode;
+  /** Called once per finished tool call when the stream ends (tool fragments never reach `onChunk`). */
+  onToolCall?: (call: ToolCall) => void;
 }
 
 /** Handle returned by {@link Conductor.chatStream}. */

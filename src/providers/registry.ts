@@ -52,6 +52,13 @@ export interface ProviderMeta {
   supportsVision: boolean;
   /** Known vision-capable model ids (first one is the default for image recognition). */
   visionModels?: string[];
+  /** Whether the provider accepts OpenAI `tools` / `tool_calls`. Default `true`. */
+  supportsTools?: boolean;
+  /**
+   * `content` sent for assistant tool-call messages with no text. Default `null`;
+   * set `''` for providers that reject `null`.
+   */
+  assistantNullContent?: '' | null;
 }
 
 /**
@@ -476,6 +483,11 @@ export function isLikelyVisionModel(provider: ProviderId, model: string): boolea
   if (provider === 'gemini') return true;
 
   return VISION_MODEL_PATTERN.test(m);
+}
+
+/** Whether a provider accepts OpenAI `tools` (registry default `true`). */
+export function providerSupportsTools(provider: ProviderId): boolean {
+  return PROVIDERS[provider].supportsTools !== false;
 }
 
 /** Resolve effective base URL (no trailing slash). */

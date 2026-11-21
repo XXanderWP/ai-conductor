@@ -24,6 +24,11 @@ export interface ProviderConfig {
   isPaid?: boolean;
   /** Default generation params for this provider. */
   params?: GenerationParams;
+  /**
+   * Whether this provider/model accepts `tools`. Overrides the registry `supportsTools`.
+   * When `false`, the entry is skipped for requests that pass `tools`.
+   */
+  supportsTools?: boolean;
 }
 
 /** Routing section of the config. */

@@ -10,6 +10,7 @@ import {
   isLikelyVisionModel,
   isProviderId,
   PROVIDERS,
+  providerSupportsTools,
   type ProviderId,
   type ProviderMeta,
 } from './providers/registry.js';
@@ -31,9 +32,16 @@ import type {
   ProviderTestResult,
   RecognizeImageOptions,
   RoutingStrategy,
+  ToolCall,
   VisionCapability,
 } from './types.js';
-import { messageText, normalizeMessages } from './utils.js';
+import {
+  hasToolMessages,
+  isToolCallMessage,
+  isToolResultMessage,
+  messageText,
+  normalizeMessages,
+} from './utils.js';
 import { toImageContentPart } from './vision.js';
 import { formatSuggestions } from './utils/suggest.js';
 
@@ -41,10 +49,18 @@ const DEFAULT_TEST_PROMPT = 'Reply with exactly: ok';
 const DEFAULT_CONNECTIVITY_TIMEOUT_MS = 15_000;
 const DEFAULT_KEEP_LAST = 4;
 const DEFAULT_RECOGNIZE_PROMPT = 'Describe this image in detail.';
+/** How many tool call ids are remembered for provider pinning. */
+const MAX_TOOL_CALL_OWNERS = 1000;
 
 /** One routing candidate with an optional model override. */
 interface ChatCandidate {
   config: ProviderConfig;
+  model?: string;
+}
+
+/** Provider + model that issued a tool call. */
+interface ToolCallOwner {
+  provider: ProviderId;
   model?: string;
 }
 
@@ -73,6 +89,7 @@ export class Conductor {
   private readonly fetchImpl: typeof globalThis.fetch;
   private ready: Promise<void>;
   private roundRobinIndex = 0;
+  private readonly toolCallOwners = new Map<string, ToolCallOwner>();
 
   constructor(options: ConductorInitOptions = {}) {
     this.init = options;
@@ -222,7 +239,11 @@ export class Conductor {
     const conversation = cloned.filter((message) => message.role !== 'system');
     const keepLast = Math.max(0, options?.keepLast ?? DEFAULT_KEEP_LAST);
 
-    if (conversation.length <= keepLast) {
+    const foldEnd = hasToolMessages(conversation)
+      ? toolSafeCutIndex(conversation, conversation.length - keepLast)
+      : conversation.length - keepLast;
+
+    if (foldEnd <= 0) {
       return {
         messages: cloned,
         summary: '',
@@ -230,12 +251,10 @@ export class Conductor {
       };
     }
 
-    const foldStart = 0;
-    const foldEnd = conversation.length - keepLast;
-    const toFold = conversation.slice(foldStart, foldEnd);
-    const kept = conversation.slice(foldEnd);
+    const toFold = conversation.slice(0, foldEnd);
+    const kept = dropOrphanToolResults(conversation.slice(foldEnd));
     const transcript = toFold
-      .map((message) => `${message.role}: ${messageText(message.content)}`)
+      .map((message) => `${message.role}: ${messageText(message)}`)
       .join('\n');
 
     const summaryPrompt = options?.summaryPrompt?.trim() || DEFAULT_SUMMARY_PROMPT;
@@ -280,7 +299,7 @@ export class Conductor {
     }
 
     const systemParts = systemMessages
-      .map((message) => messageText(message.content).trim())
+      .map((message) => messageText(message).trim())
       .filter(Boolean);
     systemParts.push(`Prior conversation context:\n${summary}`);
 
@@ -301,8 +320,7 @@ export class Conductor {
   async chat(input: string | Message[], options?: ChatOptions): Promise<ChatResponse> {
     await this.ready;
     const messages = normalizeMessages(input);
-    const candidates = this.routeCandidates(options?.provider).map((config) => ({ config }));
-    return this.executeChat(messages, options, candidates);
+    return this.executeChat(messages, options, this.chatCandidates(messages, options));
   }
 
   /**
@@ -440,6 +458,10 @@ export class Conductor {
         skipped.push(`${config.id} (no vision)`);
         continue;
       }
+      if (chatOptions.tools?.length && !this.supportsToolsFor(config)) {
+        skipped.push(`${config.id} (no tools)`);
+        continue;
+      }
       const configuredModel = this.toEndpoint(config).model;
       const model =
         chatOptions.model?.trim() ||
@@ -469,6 +491,9 @@ export class Conductor {
    * or call `cancel()` to abort. Failover only happens **before** the first content chunk;
    * after tokens start arriving, the stream stays on that provider.
    *
+   * Tool call fragments are assembled internally (never sent to `onChunk`); finished calls
+   * are reported via `options.onToolCall` and `result.toolCalls`.
+   *
    * @param input Plain string or message list.
    * @param onChunk Invoked for each piece of assistant text (see `chunkMode`).
    * @param options Per-request overrides (`chunkMode`: `delta` default, or `cumulative`).
@@ -496,7 +521,7 @@ export class Conductor {
     const messages = normalizeMessages(input);
     const strategy = this.getStrategy();
     const chunkMode = options?.chunkMode ?? 'delta';
-    const ordered = this.routeCandidates(options?.provider);
+    const ordered = this.chatCandidates(messages, options);
 
     const failedProviders: string[] = [];
     let lastError: string | undefined;
@@ -511,19 +536,20 @@ export class Conductor {
       }
     };
 
-    for (const providerConfig of ordered) {
+    for (const { config: providerConfig, model: candidateModel } of ordered) {
       if (signal.aborted) {
         throw new Error('Request cancelled');
       }
 
       const endpoint = this.toEndpoint(providerConfig);
+      const requestModel = candidateModel ?? options?.model ?? endpoint.model;
       const streamResult = await openaiChatCompletionStream(
         endpoint,
         messages,
         deliverDelta,
         {
           ...options,
-          model: options?.model ?? endpoint.model,
+          model: requestModel,
           timeoutMs: options?.timeoutMs ?? this.config.defaults?.timeoutMs,
           temperature: options?.temperature ?? this.config.defaults?.temperature,
           topP: options?.topP ?? this.config.defaults?.topP,
@@ -535,6 +561,9 @@ export class Conductor {
 
       if (streamResult.ok) {
         this.usage.record(providerConfig.id);
+        const { toolCalls, finishReason } = streamResult.data;
+        this.rememberToolCalls(toolCalls, providerConfig.id, requestModel);
+        for (const call of toolCalls ?? []) options?.onToolCall?.(call);
         return {
           content: streamResult.data.content,
           provider: providerConfig.id,
@@ -543,6 +572,8 @@ export class Conductor {
           strategy,
           failedProviders: failedProviders.length ? failedProviders : undefined,
           raw: streamResult.data.raw,
+          ...(toolCalls ? { toolCalls } : {}),
+          ...(finishReason ? { finishReason } : {}),
         };
       }
 
@@ -590,6 +621,85 @@ export class Conductor {
     return ordered;
   }
 
+  /**
+   * Routing candidates for a chat request, with tool rules applied:
+   * - with `tools`, skip providers whose `supportsTools` is `false`;
+   * - history with tool calls / results is pinned to one provider (the one that issued the
+   *   calls when known, else `options.provider` or the first routed provider) unless
+   *   `allowToolFailover` is set.
+   */
+  private chatCandidates(messages: Message[], options: ChatOptions | undefined): ChatCandidate[] {
+    const wantsTools = Boolean(options?.tools?.length);
+    const pinned = hasToolMessages(messages) && !options?.allowToolFailover;
+    const owner = options?.provider ? undefined : this.toolCallOwner(messages);
+
+    let ordered = this.routeCandidates(options?.provider ?? (pinned ? owner?.provider : undefined));
+    if (owner && !pinned) {
+      ordered = [
+        ...ordered.filter((c) => c.id === owner.provider),
+        ...ordered.filter((c) => c.id !== owner.provider),
+      ];
+    }
+
+    if (wantsTools) {
+      const skipped = ordered.filter((c) => !this.supportsToolsFor(c)).map((c) => c.id);
+      ordered = ordered.filter((c) => this.supportsToolsFor(c));
+      if (ordered.length === 0) {
+        throw new Error(
+          options?.provider
+            ? `Provider "${options.provider}" does not support tools.`
+            : `No tool-capable providers available.${skipped.length ? ` Skipped: ${skipped.join(', ')}.` : ''}`,
+        );
+      }
+    }
+
+    if (pinned) ordered = ordered.slice(0, 1);
+
+    return ordered.map((config) => ({
+      config,
+      model:
+        owner && config.id === owner.provider && !options?.model?.trim() ? owner.model : undefined,
+    }));
+  }
+
+  /** Whether a configured provider/model accepts `tools` (config overrides the registry). */
+  private supportsToolsFor(config: ProviderConfig): boolean {
+    return config.supportsTools ?? providerSupportsTools(config.id);
+  }
+
+  /** Provider that issued the most recent known tool call in the history. */
+  private toolCallOwner(messages: Message[]): ToolCallOwner | undefined {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i]!;
+      const ids = isToolCallMessage(message)
+        ? message.tool_calls.map((call) => call.id)
+        : isToolResultMessage(message)
+          ? [message.tool_call_id]
+          : [];
+      for (const id of ids) {
+        const owner = this.toolCallOwners.get(id);
+        if (owner && this.config.providers.some((p) => p.id === owner.provider)) return owner;
+      }
+    }
+    return undefined;
+  }
+
+  private rememberToolCalls(
+    toolCalls: ToolCall[] | undefined,
+    provider: ProviderId,
+    model: string | undefined,
+  ): void {
+    for (const call of toolCalls ?? []) {
+      this.toolCallOwners.delete(call.id);
+      this.toolCallOwners.set(call.id, { provider, model: model || undefined });
+    }
+    while (this.toolCallOwners.size > MAX_TOOL_CALL_OWNERS) {
+      const oldest = this.toolCallOwners.keys().next().value;
+      if (oldest === undefined) break;
+      this.toolCallOwners.delete(oldest);
+    }
+  }
+
   /** Try candidates in order until one returns a completion. */
   private async executeChat(
     messages: Message[],
@@ -602,12 +712,13 @@ export class Conductor {
 
     for (const { config: providerConfig, model: candidateModel } of candidates) {
       const endpoint = this.toEndpoint(providerConfig);
+      const requestModel = candidateModel ?? options?.model ?? endpoint.model;
       const result = await openaiChatCompletion(
         endpoint,
         messages,
         {
           ...options,
-          model: candidateModel ?? options?.model ?? endpoint.model,
+          model: requestModel,
           timeoutMs: options?.timeoutMs ?? this.config.defaults?.timeoutMs,
           temperature: options?.temperature ?? this.config.defaults?.temperature,
           topP: options?.topP ?? this.config.defaults?.topP,
@@ -618,6 +729,8 @@ export class Conductor {
 
       if (result.ok) {
         this.usage.record(providerConfig.id);
+        const { toolCalls, finishReason } = result.data;
+        this.rememberToolCalls(toolCalls, providerConfig.id, requestModel);
         return {
           content: result.data.content,
           provider: providerConfig.id,
@@ -626,6 +739,8 @@ export class Conductor {
           strategy,
           failedProviders: failedProviders.length ? failedProviders : undefined,
           raw: result.data.raw,
+          ...(toolCalls ? { toolCalls } : {}),
+          ...(finishReason ? { finishReason } : {}),
         };
       }
 
@@ -840,6 +955,34 @@ export class Conductor {
       },
     };
   }
+}
+
+/**
+ * Move a fold cut point onto a `user` message boundary so tool call / result pairs stay
+ * together: first backwards (keep more), then forwards. Returns `0` when no safe cut exists.
+ */
+function toolSafeCutIndex(conversation: Message[], target: number): number {
+  if (target <= 0) return 0;
+  if (target >= conversation.length) return conversation.length;
+  for (let i = target; i > 0; i -= 1) {
+    if (conversation[i]!.role === 'user') return i;
+  }
+  for (let i = target + 1; i < conversation.length; i += 1) {
+    if (conversation[i]!.role === 'user') return i;
+  }
+  return 0;
+}
+
+/** Drop tool results whose `tool_call_id` has no matching earlier call (providers return 400). */
+function dropOrphanToolResults(messages: Message[]): Message[] {
+  const known = new Set<string>();
+  return messages.filter((message) => {
+    if (isToolCallMessage(message)) {
+      for (const call of message.tool_calls) known.add(call.id);
+      return true;
+    }
+    return !isToolResultMessage(message) || known.has(message.tool_call_id);
+  });
 }
 
 /** @deprecated Use {@link Conductor}. Kept for early 0.1 compatibility. */
